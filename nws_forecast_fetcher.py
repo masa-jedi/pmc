@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from config import MARKET
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ async def _resolve_gridpoint(
     Resolve lat/lon to NWS grid office + coordinates.
     GET /points/{lat},{lon} → {properties: {gridId, gridX, gridY}}
     """
-    url = NWS_POINTS_URL.format(lat=MARKET.station.lat, lon=MARKET.station.lon)
+    url = NWS_POINTS_URL.format(lat=config.MARKET.station.lat, lon=config.MARKET.station.lon)
     try:
         resp = await client.get(url, headers=NWS_HEADERS)
         resp.raise_for_status()
@@ -97,7 +97,7 @@ async def fetch_nws_forecast() -> dict:
             return result
 
         # Step 3: Find the daytime period matching our target date
-        target_date = MARKET.target_date.date()
+        target_date = config.MARKET.target_date.date()
         target_high_f = None
 
         for period in periods:
@@ -116,7 +116,9 @@ async def fetch_nws_forecast() -> dict:
                 temp = period.get("temperature")
                 unit = period.get("temperatureUnit", "F")
                 if temp is not None:
-                    target_high_f = float(temp) if unit == "F" else _celsius_to_fahrenheit(temp)
+                    # NWS returns F or C; convert to market unit
+                    temp_c = float(temp) if unit == "C" else (float(temp) - 32) * 5 / 9
+                    target_high_f = config.MARKET.celsius_to_unit(temp_c)
                     result["member_details"]["nws_period"] = {
                         "name": period.get("name"),
                         "temperature": temp,

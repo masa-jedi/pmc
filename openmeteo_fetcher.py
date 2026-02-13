@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from config import MARKET
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +63,18 @@ async def fetch_openmeteo_forecast() -> dict:
         "fetch_time": datetime.now(timezone.utc).isoformat(),
     }
 
-    target_date_str = MARKET.target_date.strftime("%Y-%m-%d")
+    market = config.MARKET
+    target_date_str = market.target_date.strftime("%Y-%m-%d")
+    temp_unit = "celsius" if market.unit == "C" else "fahrenheit"
 
     async with httpx.AsyncClient(timeout=30) as client:
         for model in OPENMETEO_MODELS:
             params = {
-                "latitude": MARKET.station.lat,
-                "longitude": MARKET.station.lon,
+                "latitude": market.station.lat,
+                "longitude": market.station.lon,
                 "daily": "temperature_2m_max",
-                "temperature_unit": "fahrenheit",
-                "timezone": "America/Chicago",
+                "temperature_unit": temp_unit,
+                "timezone": market.timezone_str,
                 "start_date": target_date_str,
                 "end_date": target_date_str,
                 "models": model,

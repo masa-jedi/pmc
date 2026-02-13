@@ -19,13 +19,13 @@ from pathlib import Path
 import httpx
 import numpy as np
 
+import config
 from config import (
     DATA_DIR,
     ECMWF_CYCLES,
     ECMWF_ENS_MEMBERS,
     ECMWF_OPEN_BASE,
     HTTP_TIMEOUT_SECONDS,
-    MARKET,
     MAX_RETRIES,
 )
 
@@ -77,11 +77,13 @@ def _compute_ecmwf_steps(cycle_date: str, cycle_hour: str) -> list[int]:
     cycle_dt = datetime.strptime(f"{cycle_date}{cycle_hour}", "%Y%m%d%H").replace(
         tzinfo=timezone.utc
     )
-    target = MARKET.target_date
+    market = config.MARKET
+    target = market.target_date
 
-    # Cover Feb 12 daytime: 12Z (6AM CST) to Feb 13 06Z (midnight CST)
-    target_start = target.replace(hour=12)
-    target_end = target + timedelta(hours=30)
+    # Cover local 06:00 to midnight → convert to UTC
+    local_start_utc = 6 - market.utc_offset_hours
+    target_start = target.replace(hour=0) + timedelta(hours=local_start_utc)
+    target_end = target.replace(hour=0) + timedelta(hours=24 - market.utc_offset_hours + 6)
 
     steps = []
     all_steps = list(range(0, 145, 3)) + list(range(150, 361, 6))
@@ -191,12 +193,12 @@ async def fetch_ecmwf_open_data_via_package(
                 ds = xr.open_dataset(hres_path, engine="cfgrib")
                 temp_k = float(
                     ds["t2m"].sel(
-                        latitude=MARKET.station.lat,
-                        longitude=360 + MARKET.station.lon,
+                        latitude=config.MARKET.station.lat,
+                        longitude=config.MARKET.station.lon % 360,
                         method="nearest",
                     ).max().values
                 )
-                result["hres_forecast_f"] = round(kelvin_to_fahrenheit(temp_k), 1)
+                result["hres_forecast_f"] = round(config.MARKET.kelvin_to_unit(temp_k), 1)
                 logger.info(f"ECMWF HRES max temp: {result['hres_forecast_f']}°F")
 
             if ens_path.exists():
@@ -205,13 +207,13 @@ async def fetch_ecmwf_open_data_via_package(
                     try:
                         temp_k = float(
                             ds["t2m"].sel(
-                                latitude=MARKET.station.lat,
-                                longitude=360 + MARKET.station.lon,
+                                latitude=config.MARKET.station.lat,
+                                longitude=config.MARKET.station.lon % 360,
                                 number=member,
                                 method="nearest",
                             ).max().values
                         )
-                        temp_f = round(kelvin_to_fahrenheit(temp_k), 1)
+                        temp_f = round(config.MARKET.kelvin_to_unit(temp_k), 1)
                         result["forecast_temps_f"].append(temp_f)
                         result["member_details"][f"ens{member:02d}"] = temp_f
                     except Exception:

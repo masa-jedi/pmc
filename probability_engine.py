@@ -25,10 +25,11 @@ from config import (
     BLEND_WEIGHT_HRRR,
     BLEND_WEIGHT_NWS,
     BLEND_WEIGHT_OPENMETEO,
+    KDE_BANDWIDTH_C,
     KDE_BANDWIDTH_F,
-    MARKET,
     MIN_PROBABILITY_THRESHOLD,
 )
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -68,29 +69,33 @@ class ProbabilityDistribution:
 
 
 def _create_buckets() -> list[TemperatureBucket]:
-    """Create 2°F temperature buckets covering the expected range.
+    """Create temperature buckets matching the Polymarket market format.
 
-    Polymarket format: first bucket is "69°F or below" (catch-all ≤69),
-    then 2°F ranges (70-71, 72-73, ..., 78-79), then "80°F or higher".
+    Dallas (2°F width): "69°F or below", "70-71°F", ..., "80°F or higher"
+    Seoul  (1°C width): "3°C or below",  "4°C", "5°C", ..., "9°C or higher"
     """
+    market = config.MARKET
     buckets = []
-    width = MARKET.bucket_width_f
+    width = market.bucket_width
+    unit = market.unit_symbol
 
-    # First bucket: "69°F or below" (catch-all for temps ≤ bucket_min_f - 1)
-    # Use upper = bucket_min_f so that temps < bucket_min_f are in range [lower, upper)
-    label = f"{MARKET.bucket_min_f - 1}°F or below"
-    buckets.append(TemperatureBucket(lower_f=-100, upper_f=MARKET.bucket_min_f, label=label))
+    # First bucket: catch-all low (e.g., "69°F or below" or "3°C or below")
+    label = f"{market.bucket_min - 1}{unit} or below"
+    buckets.append(TemperatureBucket(lower_f=-100, upper_f=market.bucket_min, label=label))
 
-    # Regular 2°F buckets starting from bucket_min_f
-    for lower in range(MARKET.bucket_min_f, MARKET.bucket_max_f, width):
+    # Regular buckets
+    for lower in range(market.bucket_min, market.bucket_max, width):
         upper = lower + width
-        if upper >= MARKET.bucket_max_f:
-            # Last bucket: "80°F or higher"
-            label = f"{lower}°F or higher"
-            upper = 999  # Effectively infinity
+        if upper >= market.bucket_max:
+            # Last bucket: catch-all high
+            label = f"{lower}{unit} or higher"
+            upper = 999
+        elif width == 1:
+            # Single-degree buckets: "4°C", "5°C", etc.
+            label = f"{lower}{unit}"
         else:
-            # Middle buckets: "70-71°F"
-            label = f"{lower}-{upper - 1}°F"
+            # Multi-degree buckets: "70-71°F", "72-73°F", etc.
+            label = f"{lower}-{upper - 1}{unit}"
         buckets.append(TemperatureBucket(lower_f=lower, upper_f=upper, label=label))
 
     return buckets
@@ -116,7 +121,7 @@ def histogram_probabilities(
                 break
         else:
             # Temperature outside our range — assign to nearest edge bucket
-            if temp < MARKET.bucket_min_f:
+            if temp < config.MARKET.bucket_min:
                 buckets[0].member_count += 1
             else:
                 buckets[-1].member_count += 1
@@ -129,7 +134,7 @@ def histogram_probabilities(
 
 def kde_probabilities(
     temps_f: list[float],
-    bandwidth: float = KDE_BANDWIDTH_F,
+    bandwidth: float | None = None,
 ) -> list[TemperatureBucket]:
     """
     Kernel Density Estimation: fit a smooth probability surface over the
@@ -138,6 +143,9 @@ def kde_probabilities(
     This gives more realistic probabilities especially in bucket boundaries
     and tails where simple counting would show 0%.
     """
+    if bandwidth is None:
+        bandwidth = KDE_BANDWIDTH_C if config.MARKET.unit == "C" else KDE_BANDWIDTH_F
+
     buckets = _create_buckets()
     temps = np.array(temps_f)
     n = len(temps)
@@ -152,12 +160,24 @@ def kde_probabilities(
         logger.warning("KDE failed, falling back to histogram")
         return histogram_probabilities(temps_f)
 
+    # Find the actual data range to clip the KDE integration
+    data_min = temps.min()
+    data_max = temps.max()
+
     # Integrate KDE over each bucket
     for bucket in buckets:
-        # Use numerical integration with fine grid
-        x = np.linspace(bucket.lower_f, bucket.upper_f, 100)
-        pdf_values = kde(x)
-        bucket.probability = float(np.trapezoid(pdf_values, x))
+        # Clip integration to actual data range to avoid mass in impossible regions
+        x_min = max(bucket.lower_f, data_min)
+        x_max = min(bucket.upper_f, data_max + 3 * bandwidth)
+
+        # Skip buckets entirely outside the data range
+        if x_max <= x_min:
+            bucket.probability = 0.0
+        else:
+            # Use numerical integration with fine grid
+            x = np.linspace(x_min, x_max, 100)
+            pdf_values = kde(x)
+            bucket.probability = float(np.trapezoid(pdf_values, x))
 
         # Also count members for reference
         for temp in temps:
@@ -283,30 +303,65 @@ def compute_distribution(
 
 def format_distribution(dist: ProbabilityDistribution) -> str:
     """Pretty-print the probability distribution for logging/display."""
+    market = config.MARKET
+    u = market.unit_symbol
+
+    # Build source count string based on available sources
+    src_parts = []
+    if dist.gefs_count:
+        src_parts.append(f"GEFS:{dist.gefs_count}")
+    if dist.ecmwf_count:
+        src_parts.append(f"ECMWF:{dist.ecmwf_count}")
+    if dist.hrrr_count:
+        src_parts.append(f"HRRR:{dist.hrrr_count}")
+    if dist.nws_count:
+        src_parts.append(f"NWS:{dist.nws_count}")
+    if dist.openmeteo_count:
+        src_parts.append(f"OM:{dist.openmeteo_count}")
+    src_str = " ".join(src_parts) if src_parts else "none"
+
+    # Header columns depend on which sources are active
+    has_hrrr = "hrrr" in market.sources
+    has_nws = "nws" in market.sources
+
     lines = [
         "=" * 70,
-        f"  TEMPERATURE PROBABILITY DISTRIBUTION — {MARKET.station.name}",
-        f"  Target: {MARKET.target_date.strftime('%B %d, %Y')} (Daily High)",
-        f"  Method: {dist.method} | Sources: {dist.total_members} "
-        f"(GEFS:{dist.gefs_count} ECMWF:{dist.ecmwf_count} HRRR:{dist.hrrr_count} "
-        f"NWS:{dist.nws_count} OM:{dist.openmeteo_count})",
-        f"  Ensemble Mean: {dist.ensemble_mean_f:.1f}°F ± {dist.ensemble_std_f:.1f}°F",
-        f"  Range: {dist.ensemble_min_f:.1f}°F — {dist.ensemble_max_f:.1f}°F",
+        f"  TEMPERATURE PROBABILITY DISTRIBUTION — {market.station.name}",
+        f"  Target: {market.target_date.strftime('%B %d, %Y')} (Daily High)",
+        f"  Method: {dist.method} | Sources: {dist.total_members} ({src_str})",
+        f"  Ensemble Mean: {dist.ensemble_mean_f:.1f}{u} ± {dist.ensemble_std_f:.1f}{u}",
+        f"  Range: {dist.ensemble_min_f:.1f}{u} — {dist.ensemble_max_f:.1f}{u}",
         "=" * 70,
         "",
-        f"  {'Bucket':<22} {'Prob':>7} {'Bar':<24} {'GEFS':>6} {'ECMWF':>6} {'HRRR':>6} {'NWS':>6} {'OM':>6}",
-        f"  {'─' * 22} {'─' * 7} {'─' * 24} {'─' * 6} {'─' * 6} {'─' * 6} {'─' * 6} {'─' * 6}",
     ]
+
+    # Build table header dynamically
+    hdr = f"  {'Bucket':<22} {'Prob':>7} {'Bar':<24} {'GEFS':>6} {'ECMWF':>6}"
+    sep = f"  {'─' * 22} {'─' * 7} {'─' * 24} {'─' * 6} {'─' * 6}"
+    if has_hrrr:
+        hdr += f" {'HRRR':>6}"
+        sep += f" {'─' * 6}"
+    if has_nws:
+        hdr += f" {'NWS':>6}"
+        sep += f" {'─' * 6}"
+    hdr += f" {'OM':>6}"
+    sep += f" {'─' * 6}"
+    lines.extend([hdr, sep])
 
     for bucket in dist.buckets:
         bar_len = int(bucket.probability * 50)
         bar = "█" * bar_len
 
-        lines.append(
+        row = (
             f"  {bucket.label:<22} {bucket.probability:>6.1%} {bar:<24} "
-            f"{bucket.gefs_prob:>5.1%} {bucket.ecmwf_prob:>5.1%} {bucket.hrrr_prob:>5.1%} "
-            f"{bucket.nws_prob:>5.1%} {bucket.openmeteo_prob:>5.1%}"
+            f"{bucket.gefs_prob:>5.1%} {bucket.ecmwf_prob:>5.1%}"
         )
+        if has_hrrr:
+            row += f" {bucket.hrrr_prob:>5.1%}"
+        if has_nws:
+            row += f" {bucket.nws_prob:>5.1%}"
+        row += f" {bucket.openmeteo_prob:>5.1%}"
+        lines.append(row)
 
     lines.extend([
         "",
@@ -317,7 +372,8 @@ def format_distribution(dist: ProbabilityDistribution) -> str:
     return "\n".join(lines)
 
 
-_STATION_UTC_OFFSET = timedelta(hours=-6)  # Dallas CST
+def _station_utc_offset() -> timedelta:
+    return config.MARKET.utc_offset
 
 
 def apply_reality_check(
@@ -361,35 +417,59 @@ def apply_reality_check(
         )
 
     # ── 1. Bias correction ───────────────────────────────────────────────────
-    model_avg = sum(all_raw) / len(all_raw)
-    bias = current_temp_f - model_avg
-    logger.info(
-        f"Applying bias correction: Obs={current_temp_f}, ModelAvg={model_avg:.1f}, "
-        f"Bias={bias:+.1f}°F"
-    )
+    # Only apply bias correction if we have a known observed high (NWS hourly data).
+    # For Open-Meteo, we only have current temp, not hourly history, so we can't
+    # reliably determine the bias - skip it to avoid corrupting the forecast.
+    if observed_high_f is not None:
+        model_avg = sum(all_raw) / len(all_raw)
+        bias = current_temp_f - model_avg
+        u = config.MARKET.unit_symbol
+        logger.info(
+            f"Applying bias correction: Obs={current_temp_f}{u}, ModelAvg={model_avg:.1f}{u}, "
+            f"Bias={bias:+.1f}{u}"
+        )
 
-    gefs_shifted = {**gefs_data, "forecast_temps_f": [t + bias for t in gefs_temps]}
-    ecmwf_shifted = {**ecmwf_data, "forecast_temps_f": [t + bias for t in ecmwf_temps]}
-    hrrr_shifted = None
-    if hrrr_data:
-        hrrr_shifted = {**hrrr_data, "forecast_temps_f": [t + bias for t in hrrr_temps]}
-    nws_shifted = None
-    if nws_data:
-        nws_shifted = {**nws_data, "forecast_temps_f": [t + bias for t in nws_temps]}
-    openmeteo_shifted = None
-    if openmeteo_data:
-        openmeteo_shifted = {**openmeteo_data, "forecast_temps_f": [t + bias for t in openmeteo_temps]}
+        gefs_shifted = {**gefs_data, "forecast_temps_f": [t + bias for t in gefs_temps]}
+        ecmwf_shifted = {**ecmwf_data, "forecast_temps_f": [t + bias for t in ecmwf_temps]}
+        hrrr_shifted = None
+        if hrrr_data:
+            hrrr_shifted = {**hrrr_data, "forecast_temps_f": [t + bias for t in hrrr_temps]}
+        nws_shifted = None
+        if nws_data:
+            nws_shifted = {**nws_data, "forecast_temps_f": [t + bias for t in nws_temps]}
+        openmeteo_shifted = None
+        if openmeteo_data:
+            openmeteo_shifted = {**openmeteo_data, "forecast_temps_f": [t + bias for t in openmeteo_temps]}
+    else:
+        # No observed high available - use raw forecasts without bias correction
+        logger.info("No observed high (Open-Meteo) - using raw model forecasts")
+        gefs_shifted = gefs_data
+        ecmwf_shifted = ecmwf_data
+        hrrr_shifted = hrrr_data
+        nws_shifted = nws_data
+        openmeteo_shifted = openmeteo_data
+
     dist = compute_distribution(
         gefs_shifted, ecmwf_shifted, hrrr_data=hrrr_shifted,
         nws_data=nws_shifted, openmeteo_data=openmeteo_shifted,
     )
 
     # ── 2. Impossibility check ───────────────────────────────────────────────
-    logger.info(f"Applying reality check: Observed High = {observed_high_f}°F")
+    # Use max observed temperature as floor - any bucket that is entirely at or
+    # below the observed high is impossible (we already know the high was at least this).
+    # If observed_high_f is not available, fall back to current_temp_f.
+    floor_temp = observed_high_f if observed_high_f is not None else current_temp_f
+
+    if floor_temp is not None:
+        u = config.MARKET.unit_symbol
+        if observed_high_f is not None:
+            logger.info(f"Applying observed high floor: Max observed = {observed_high_f}{u}")
+        else:
+            logger.info(f"Applying current temp floor: Current = {current_temp_f}{u}")
 
     invalidated = 0
     for bucket in dist.buckets:
-        if bucket.upper_f <= observed_high_f:
+        if floor_temp is not None and bucket.upper_f <= floor_temp:
             bucket.probability = 0.0
             bucket.gefs_prob = 0.0
             bucket.ecmwf_prob = 0.0
@@ -400,16 +480,27 @@ def apply_reality_check(
 
     remaining_mass = sum(b.probability for b in dist.buckets)
     if invalidated:
-        logger.info(
-            f"  Reality check invalidated {invalidated} buckets. "
-            f"Renormalizing remaining {remaining_mass:.1%} mass."
-        )
+        if observed_high_f is not None:
+            logger.info(
+                f"  Observed high floor invalidated {invalidated} buckets. "
+                f"Renormalizing remaining {remaining_mass:.1%} mass."
+            )
+        else:
+            logger.info(
+                f"  Current temp floor invalidated {invalidated} buckets. "
+                f"Renormalizing remaining {remaining_mass:.1%} mass."
+            )
+
+    # Also apply observed_high_f check if available (peak has passed)
+    if observed_high_f is None:
+        dist = _renormalize(dist)
+        return dist
 
     # ── 3. Time-aware peak detection ────────────────────────────────────────
     # Determine current local hour from the observation timestamp
     now_local_hour: int | None = None
     if observed_at is not None:
-        now_local_hour = (observed_at + _STATION_UTC_OFFSET).hour
+        now_local_hour = (observed_at + _station_utc_offset()).hour
 
     # Time-dependent threshold: require a larger temperature drop before
     # concluding the peak has passed when afternoon heating is still ahead.
@@ -432,7 +523,7 @@ def apply_reality_check(
         high_local_hour: int | None = None
 
         if observed_high_time is not None:
-            high_local_hour = (observed_high_time + _STATION_UTC_OFFSET).hour
+            high_local_hour = (observed_high_time + _station_utc_offset()).hour
             if high_local_hour < 10:
                 peak_discount = 0.40
             elif high_local_hour < 14:

@@ -1,10 +1,10 @@
 """
 Configuration for Weather Prediction Data Ingestion Pipeline
-Target: Dallas Love Field Station (KDAL) — Feb 12, 2026
+Supports multiple markets (Dallas, Seoul, etc.)
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 @dataclass(frozen=True)
@@ -19,11 +19,33 @@ class StationConfig:
 class TargetMarket:
     station: StationConfig
     target_date: datetime
-    bucket_width_f: int = 2  # 2°F buckets to match Polymarket
-    # Range adjusted to match Polymarket's Feb 12 Dallas market (69-80°F+)
-    # Extended to cover forecast uncertainty
-    bucket_min_f: int = 70  # Regular buckets start at "70-71°F" (first catch-all is "69°F or below")
-    bucket_max_f: int = 82  # Last bucket is "80°F or higher" (range goes 70, 72, 74, 76, 78, 80)
+    bucket_width: int = 2       # Bucket width in market units (2°F or 1°C)
+    bucket_min: int = 70        # Regular buckets start here
+    bucket_max: int = 82        # Triggers last catch-all bucket
+    unit: str = "F"             # "F" or "C"
+    utc_offset_hours: int = -6  # Local timezone offset from UTC
+    timezone_str: str = "America/Chicago"  # For Open-Meteo API
+    sources: tuple = ("gefs", "ecmwf", "hrrr", "nws", "openmeteo")
+
+    def kelvin_to_unit(self, k: float) -> float:
+        """Convert Kelvin to the market's temperature unit."""
+        if self.unit == "C":
+            return k - 273.15
+        return (k - 273.15) * 9 / 5 + 32
+
+    def celsius_to_unit(self, c: float) -> float:
+        """Convert Celsius to the market's temperature unit."""
+        if self.unit == "C":
+            return c
+        return c * 9 / 5 + 32
+
+    @property
+    def unit_symbol(self) -> str:
+        return f"°{self.unit}"
+
+    @property
+    def utc_offset(self) -> timedelta:
+        return timedelta(hours=self.utc_offset_hours)
 
 
 # ── Stations ────────────────────────────────────────────────────────────────
@@ -34,11 +56,53 @@ DALLAS_LOVE_FIELD = StationConfig(
     lon=-96.852,  # Negative = West
 )
 
-# ── Target Market ───────────────────────────────────────────────────────────
-MARKET = TargetMarket(
+INCHEON_INTL = StationConfig(
+    name="Incheon Intl Airport",
+    icao="RKSI",
+    lat=37.4692,
+    lon=126.4505,
+)
+
+# ── Markets ────────────────────────────────────────────────────────────────
+MARKET_DALLAS = TargetMarket(
     station=DALLAS_LOVE_FIELD,
     target_date=datetime(2026, 2, 12, tzinfo=timezone.utc),
+    bucket_width=2,
+    bucket_min=70,    # Regular buckets: 70-71, 72-73, ..., 78-79
+    bucket_max=82,    # Last bucket: "80°F or higher"
+    unit="F",
+    utc_offset_hours=-6,
+    timezone_str="America/Chicago",
+    sources=("gefs", "ecmwf", "hrrr", "nws", "openmeteo"),
 )
+
+MARKET_SEOUL = TargetMarket(
+    station=INCHEON_INTL,
+    target_date=datetime(2026, 2, 13, tzinfo=timezone.utc),
+    bucket_width=1,
+    bucket_min=4,     # Regular buckets: 4, 5, 6, 7, 8
+    bucket_max=10,    # Last bucket: "9°C or higher"
+    unit="C",
+    utc_offset_hours=9,
+    timezone_str="Asia/Seoul",
+    sources=("ecmwf", "openmeteo"),  # GEFS doesn't serve Korea well via NOMADS
+)
+
+MARKETS = {
+    "dallas": MARKET_DALLAS,
+    "seoul": MARKET_SEOUL,
+}
+
+# ── Active Market (set via set_market() before importing fetchers) ─────────
+MARKET = MARKET_DALLAS
+
+
+def set_market(name: str) -> None:
+    """Switch the active market. Must be called before fetcher imports."""
+    global MARKET
+    if name not in MARKETS:
+        raise ValueError(f"Unknown market '{name}'. Available: {list(MARKETS.keys())}")
+    MARKET = MARKETS[name]
 
 # ── GFS Ensemble (GEFS) Configuration ──────────────────────────────────────
 # NOMADS GRIB filter endpoint for GEFS 0.25° resolution
@@ -87,7 +151,8 @@ RETRY_DELAY_SECONDS = 30
 HTTP_TIMEOUT_SECONDS = 60
 
 # ── Probability Engine ──────────────────────────────────────────────────────
-# Kernel Density Estimation bandwidth (°F) for smoothing ensemble spread
-KDE_BANDWIDTH_F = 1.5
+# Kernel Density Estimation bandwidth for smoothing ensemble spread
+KDE_BANDWIDTH_F = 1.5   # °F bandwidth (Dallas)
+KDE_BANDWIDTH_C = 0.8   # °C bandwidth (Seoul) — roughly equivalent
 # Minimum probability to report
 MIN_PROBABILITY_THRESHOLD = 0.001  # 0.1%
