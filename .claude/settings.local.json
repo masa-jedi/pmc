@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(curl:*)",
+      "Bash(ls:*)",
+      "Read(//root/masa/jedi/pmc/**)",
+      "Bash(xargs cat:*)"
+    ]
+  }
+}
