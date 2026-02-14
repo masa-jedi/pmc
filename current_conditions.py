@@ -363,3 +363,216 @@ async def _process_nws_observations(
         "observed_at": latest_time,
         "source": "nws",
     }
+
+
+# Weather.com historical observations URL template
+WEATHER_COM_URL = "https://api.weather.com/v1/location/{icao}:9:US/observations/historical.json"
+
+
+def _parse_precip_intensity(wx_phrase: str) -> float:
+    """
+    Parse precipitation intensity from wx_phrase.
+
+    Returns intensity from 0.0-1.0:
+    - "Light" -> 0.3
+    - "Heavy" -> 1.0
+    - "Moderate" or no prefix -> 0.6
+    - "Thunder" / "T-Storm" -> 0.8 (storms are significant)
+    """
+    phrase_lower = wx_phrase.lower() if wx_phrase else ""
+
+    if "thunder" in phrase_lower or "t-storm" in phrase_lower:
+        return 0.8
+    if "heavy" in phrase_lower:
+        return 1.0
+    if "light" in phrase_lower:
+        return 0.3
+    # Check for any precipitation keywords
+    if "rain" in phrase_lower or "storm" in phrase_lower or "drizzle" in phrase_lower:
+        return 0.6
+    return 0.0
+
+
+def _is_precipitation(wx_phrase: str) -> bool:
+    """Check if wx_phrase indicates precipitation (rain, thunder, storm)."""
+    if not wx_phrase:
+        return False
+    phrase_lower = wx_phrase.lower()
+    precip_keywords = ["rain", "thunder", "t-storm", "storm", "drizzle", "showers", "precip"]
+    return any(keyword in phrase_lower for keyword in precip_keywords)
+
+
+async def fetch_weather_conditions(
+    icao: str,
+    target_date,
+    as_of_utc: datetime | None = None,
+) -> dict | None:
+    """
+    Fetch weather conditions (precipitation, thunder, storm) for the target date.
+
+    For US stations (ICAO format like KDAL): Uses weather.com historical observations API.
+    For non-US stations: Falls back to Open-Meteo precipitation data.
+
+    Returns:
+        {
+            "has_rain": bool,
+            "has_thunder": bool,
+            "has_storm": bool,
+            "is_active_precipitation": bool,  # True if latest obs has rain/thunder
+            "latest_phrase": str,
+            "precip_intensity": float,  # 0.0-1.0 based on keywords
+            "source": str,  # "weathercom" or "openmeteo"
+        }
+        or None if the fetch fails.
+    """
+    market = config.MARKET
+
+    # Check if this is a US station (ICAO format: 3-4 letter code)
+    # US ICAOs start with K for continental US
+    is_us_station = icao.startswith("K") and len(icao) == 4
+
+    if is_us_station:
+        return await _fetch_weathercom_conditions(icao, target_date, as_of_utc)
+    else:
+        # Non-US station: use Open-Meteo precipitation
+        return await _fetch_openmeteo_precip(icao, target_date, as_of_utc)
+
+
+async def _fetch_weathercom_conditions(
+    icao: str,
+    target_date,
+    as_of_utc: datetime | None = None,
+) -> dict | None:
+    """Fetch weather conditions from weather.com API for US stations."""
+    from datetime import timezone as tz
+
+    # Format date for API (YYYYMMDD)
+    date_str = target_date.strftime("%Y%m%d")
+
+    url = WEATHER_COM_URL.format(icao=icao) + f"?apiKey={config.WEATHER_COM_API_KEY}&units=e&startDate={date_str}&endDate={date_str}"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.warning(f"Weather.com fetch failed: {e}")
+            return None
+
+    data = resp.json()
+    observations = data.get("observations", [])
+
+    if not observations:
+        logger.warning("No observations in weather.com response")
+        return None
+
+    # Analyze all observations for the day
+    has_rain = False
+    has_thunder = False
+    has_storm = False
+    latest_phrase = None
+    latest_obs_time = None
+
+    for obs in observations:
+        wx_phrase = obs.get("wx_phrase")
+        valid_time_gmt = obs.get("valid_time_gmt")
+
+        if not wx_phrase:
+            continue
+
+        # Track latest observation
+        if valid_time_gmt:
+            obs_time = datetime.fromtimestamp(valid_time_gmt, tz=tz.utc)
+            # Skip observations after as_of_utc for backtesting
+            if as_of_utc and obs_time > as_of_utc:
+                continue
+            if latest_obs_time is None or obs_time > latest_obs_time:
+                latest_obs_time = obs_time
+                latest_phrase = wx_phrase
+
+        # Check for precipitation types
+        phrase_lower = wx_phrase.lower()
+        if "rain" in phrase_lower or "drizzle" in phrase_lower or "showers" in phrase_lower:
+            has_rain = True
+        if "thunder" in phrase_lower or "t-storm" in phrase_lower:
+            has_thunder = True
+        if "storm" in phrase_lower:
+            has_storm = True
+
+    # Determine if precipitation is active (in the latest observation)
+    is_active = _is_precipitation(latest_phrase)
+    precip_intensity = _parse_precip_intensity(latest_phrase) if latest_phrase else 0.0
+
+    logger.info(
+        f"Weather.com conditions for {icao}: phrase='{latest_phrase}', "
+        f"rain={has_rain}, thunder={has_thunder}, storm={has_storm}, "
+        f"active={is_active}, intensity={precip_intensity}"
+    )
+
+    return {
+        "has_rain": has_rain,
+        "has_thunder": has_thunder,
+        "has_storm": has_storm,
+        "is_active_precipitation": is_active,
+        "latest_phrase": latest_phrase,
+        "precip_intensity": precip_intensity,
+        "source": "weathercom",
+    }
+
+
+async def _fetch_openmeteo_precip(
+    icao: str,
+    target_date,
+    as_of_utc: datetime | None = None,
+) -> dict | None:
+    """Fetch precipitation data from Open-Meteo for non-US stations."""
+    market = config.MARKET
+
+    # Use Open-Meteo current weather to get precipitation
+    url = (
+        f"{OPENMETEO_CURR_URL}"
+        f"?latitude={market.station.lat}&longitude={market.station.lon}"
+        f"&current=precipitation,rain,showers,snowfall"
+        f"&timezone=auto"
+    )
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.warning(f"Open-Meteo precipitation fetch failed: {e}")
+            return None
+
+    data = resp.json()
+    current = data.get("current", {})
+    precip = current.get("precipitation", 0.0)
+    rain = current.get("rain", 0.0)
+    showers = current.get("showers", 0.0)
+    snowfall = current.get("snowfall", 0.0)
+
+    # Any precipitation > 0 counts as rain
+    has_precip = precip > 0 or rain > 0 or showers > 0 or snowfall > 0
+
+    # Simple intensity based on amount (scale mm to 0-1)
+    if has_precip:
+        precip_intensity = min(1.0, (precip + rain + showers) / 5.0)
+    else:
+        precip_intensity = 0.0
+
+    # For non-US stations, we don't have separate thunder/storm detection
+    # Just indicate if there's any precipitation
+    logger.info(
+        f"Open-Meteo precip for {icao}: precip={precip}mm, "
+        f"has_precip={has_precip}, intensity={precip_intensity}"
+    )
+
+    return {
+        "has_rain": has_precip,
+        "has_thunder": False,  # Not available from Open-Meteo current
+        "has_storm": False,     # Not available from Open-Meteo current
+        "is_active_precipitation": has_precip,
+        "latest_phrase": f"Precipitation {precip}mm" if has_precip else "Clear",
+        "precip_intensity": precip_intensity,
+        "source": "openmeteo",
+    }

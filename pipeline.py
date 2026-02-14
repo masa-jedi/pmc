@@ -71,7 +71,7 @@ async def run_pipeline(
         find_arbitrage_opportunities,
         format_distribution,
     )
-    from current_conditions import fetch_current_conditions
+    from current_conditions import fetch_current_conditions, fetch_weather_conditions
 
     market = config.MARKET
     u = market.unit_symbol
@@ -202,6 +202,13 @@ async def run_pipeline(
     t0 = time.time()
 
     obs = await fetch_current_conditions(market.station.icao)
+
+    # Fetch weather conditions (precipitation, thunder, storm)
+    weather_conditions = await fetch_weather_conditions(
+        market.station.icao,
+        market.target_date,
+    )
+
     if obs:
         distribution = apply_reality_check(
             gefs_data,
@@ -213,6 +220,7 @@ async def run_pipeline(
             hrrr_data=hrrr_data,
             nws_data=nws_data,
             openmeteo_data=openmeteo_data,
+            weather_conditions=weather_conditions,
         )
     else:
         logger.warning("  No current observations — using pure forecast (no bias correction)")

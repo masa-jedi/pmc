@@ -66,10 +66,10 @@ INCHEON_INTL = StationConfig(
 # ── Markets ────────────────────────────────────────────────────────────────
 MARKET_DALLAS = TargetMarket(
     station=DALLAS_LOVE_FIELD,
-    target_date=datetime(2026, 2, 13, tzinfo=timezone.utc),
+    target_date=datetime(2026, 2, 14, tzinfo=timezone.utc),
     bucket_width=2,
-    bucket_min=56,    # Regular buckets: 70-71, 72-73, ..., 78-79
-    bucket_max=69,    # Last bucket: "80°F or higher"
+    bucket_min=54,    # Regular buckets: 70-71, 72-73, ..., 78-79
+    bucket_max=71,    # Last bucket: "80°F or higher"
     unit="F",
     utc_offset_hours=-6,
     timezone_str="America/Chicago",
@@ -149,6 +149,11 @@ FETCH_INTERVAL_SECONDS = 3600  # 1 hour
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 30
 HTTP_TIMEOUT_SECONDS = 60
+
+# ── Weather.com Configuration ────────────────────────────────────────────────
+# Historical observations API for US stations
+WEATHER_COM_API_KEY = "e1f10a1e78da46f5b10a1e78da96f525"
+WEATHER_COM_BASE_URL = "https://api.weather.com/v1/location/{icao}:9:US/observations/historical.json"
 
 # ── Probability Engine ──────────────────────────────────────────────────────
 # Kernel Density Estimation bandwidth for smoothing ensemble spread

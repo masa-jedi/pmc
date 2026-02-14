@@ -387,6 +387,7 @@ def apply_reality_check(
     nws_data: dict | None = None,
     openmeteo_data: dict | None = None,
     peak_passed_threshold_f: float = 1.5,
+    weather_conditions: dict | None = None,
 ) -> "ProbabilityDistribution":
     """
     Apply real-world observations to anchor the forecast distribution to reality.
@@ -401,7 +402,9 @@ def apply_reality_check(
        b) When the high was observed determines a secondary discount factor
           (overnight high → mild, afternoon high → strong).
        The more conservative of the two factors is used.
-    4. Renormalize
+    4. Weather condition discounting — if actively raining/thundering,
+       discount higher buckets (storm systems inhibit solar heating).
+    5. Renormalize
     """
     gefs_temps = gefs_data.get("forecast_temps_f", [])
     ecmwf_temps = ecmwf_data.get("forecast_temps_f", [])
@@ -580,7 +583,34 @@ def apply_reality_check(
                 bucket.nws_prob *= peak_discount
                 bucket.openmeteo_prob *= peak_discount
 
-    # ── 4. Renormalize ───────────────────────────────────────────────────────
+    # ── 4. Weather condition discounting ───────────────────────────────────────
+    # If it's actively raining/thundering, discount higher buckets since storm
+    # systems typically bring cooler air and inhibit solar heating.
+    if weather_conditions and weather_conditions.get("is_active_precipitation"):
+        # Moderate discount: 15% base + intensity modifier (up to 20% total)
+        intensity = weather_conditions.get("precip_intensity", 0.5)
+        weather_discount = 1.0 - (0.15 + intensity * 0.05)  # 15-20% discount
+
+        # Use observed high if available, otherwise current temp as threshold
+        threshold = observed_high_f if observed_high_f else current_temp_f
+
+        u = config.MARKET.unit_symbol
+        logger.info(
+            f"  Weather discount: active precip ('{weather_conditions.get('latest_phrase')}'), "
+            f"intensity={intensity:.2f}, discount={weather_discount:.1%}, "
+            f"threshold={threshold}{u}"
+        )
+
+        for bucket in dist.buckets:
+            if bucket.lower_f >= threshold and bucket.probability > 0:
+                bucket.probability *= weather_discount
+                bucket.gefs_prob *= weather_discount
+                bucket.ecmwf_prob *= weather_discount
+                bucket.hrrr_prob *= weather_discount
+                bucket.nws_prob *= weather_discount
+                bucket.openmeteo_prob *= weather_discount
+
+    # ── 5. Renormalize ───────────────────────────────────────────────────────
     total_combined = sum(b.probability for b in dist.buckets)
     total_gefs = sum(b.gefs_prob for b in dist.buckets)
     total_ecmwf = sum(b.ecmwf_prob for b in dist.buckets)
