@@ -491,6 +491,22 @@ def apply_reality_check(
                 f"Renormalizing remaining {remaining_mass:.1%} mass."
             )
 
+    # If all probability was invalidated but we have an observed high, the observed high
+    # must contain the daily maximum - shift all probability to the lowest bucket that
+    # can contain the observed high temperature.
+    if remaining_mass == 0.0 and floor_temp is not None:
+        for bucket in dist.buckets:
+            if bucket.lower_f >= floor_temp:
+                bucket.probability = 1.0
+                bucket.gefs_prob = 1.0
+                bucket.ecmwf_prob = 1.0
+                bucket.hrrr_prob = 1.0
+                bucket.nws_prob = 1.0
+                bucket.openmeteo_prob = 1.0
+                logger.info(f"  Distribution shifted to '{bucket.label}' (observed high exceeds all forecasts)")
+                remaining_mass = 1.0
+                break
+
     # Also apply observed_high_f check if available (peak has passed)
     if observed_high_f is None:
         dist = _renormalize(dist)
@@ -547,11 +563,12 @@ def apply_reality_check(
 
         high_hour_str = f" at local hour {high_local_hour:02d}:xx" if high_local_hour is not None else ""
         now_hour_str = f", now local hour {now_local_hour:02d}:xx" if now_local_hour is not None else ""
+        u = config.MARKET.unit_symbol
         logger.info(
-            f"  Peak appears to have passed (current={current_temp_f}°F < "
-            f"high={observed_high_f}°F − {effective_threshold}°F{high_hour_str}"
+            f"  Peak appears to have passed (current={current_temp_f}{u} < "
+            f"high={observed_high_f}{u} − {effective_threshold}{u}{high_hour_str}"
             f"{now_hour_str}). "
-            f"Discounting buckets above {observed_high_f}°F by {peak_discount:.0%}."
+            f"Discounting buckets above {observed_high_f}{u} by {peak_discount:.0%}."
         )
 
         for bucket in dist.buckets:
