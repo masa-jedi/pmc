@@ -148,6 +148,11 @@ async def _fetch_openmeteo_historical(
         except ValueError:
             continue
 
+        # Open-Meteo returns local times (no timezone info) when timezone=auto
+        # Convert to UTC and make timezone-aware
+        obs_time = obs_time - utc_offset
+        obs_time = obs_time.replace(tzinfo=tz.utc)
+
         # Convert to local date using the station's UTC offset
         obs_local_date = (obs_time + utc_offset).date()
         if obs_local_date != target_local_date:
@@ -178,6 +183,12 @@ async def _fetch_openmeteo_historical(
             obs_time = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
         except ValueError:
             continue
+
+        # Open-Meteo returns local times (no timezone info) when timezone=auto
+        # Convert to UTC and make timezone-aware
+        obs_time = obs_time - utc_offset
+        obs_time = obs_time.replace(tzinfo=tz.utc)
+
         obs_local_date = (obs_time + utc_offset).date()
         if obs_local_date != target_local_date:
             continue

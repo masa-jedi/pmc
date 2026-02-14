@@ -66,10 +66,10 @@ INCHEON_INTL = StationConfig(
 # ── Markets ────────────────────────────────────────────────────────────────
 MARKET_DALLAS = TargetMarket(
     station=DALLAS_LOVE_FIELD,
-    target_date=datetime(2026, 2, 12, tzinfo=timezone.utc),
+    target_date=datetime(2026, 2, 13, tzinfo=timezone.utc),
     bucket_width=2,
-    bucket_min=70,    # Regular buckets: 70-71, 72-73, ..., 78-79
-    bucket_max=82,    # Last bucket: "80°F or higher"
+    bucket_min=56,    # Regular buckets: 70-71, 72-73, ..., 78-79
+    bucket_max=69,    # Last bucket: "80°F or higher"
     unit="F",
     utc_offset_hours=-6,
     timezone_str="America/Chicago",
@@ -78,10 +78,10 @@ MARKET_DALLAS = TargetMarket(
 
 MARKET_SEOUL = TargetMarket(
     station=INCHEON_INTL,
-    target_date=datetime(2026, 2, 13, tzinfo=timezone.utc),
+    target_date=datetime(2026, 2, 14, tzinfo=timezone.utc),
     bucket_width=1,
-    bucket_min=4,     # Regular buckets: 4, 5, 6, 7, 8
-    bucket_max=10,    # Last bucket: "9°C or higher"
+    bucket_min=2,     # Regular buckets: 4, 5, 6, 7, 8
+    bucket_max=12,    # Last bucket: "9°C or higher"
     unit="C",
     utc_offset_hours=9,
     timezone_str="Asia/Seoul",
