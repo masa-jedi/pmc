@@ -78,14 +78,14 @@ MARKET_DALLAS = TargetMarket(
 
 MARKET_SEOUL = TargetMarket(
     station=INCHEON_INTL,
-    target_date=datetime(2026, 2, 14, tzinfo=timezone.utc),
+    target_date=datetime(2026, 2, 15, tzinfo=timezone.utc),
     bucket_width=1,
-    bucket_min=2,     # Regular buckets: 4, 5, 6, 7, 8
-    bucket_max=12,    # Last bucket: "9°C or higher"
+    bucket_min=0,     # Regular buckets: 4, 5, 6, 7, 8
+    bucket_max=10,    # Last bucket: "9°C or higher"
     unit="C",
     utc_offset_hours=9,
     timezone_str="Asia/Seoul",
-    sources=("ecmwf", "openmeteo"),  # GEFS doesn't serve Korea well via NOMADS
+    sources=("ecmwf", "openmeteo", "metar"),  # GEFS doesn't serve Korea well via NOMADS
 )
 
 MARKETS = {
@@ -141,6 +141,7 @@ BLEND_WEIGHT_HRRR = 0.10
 BLEND_WEIGHT_OPENMETEO = 0.55
 BLEND_WEIGHT_ECMWF = 0.025
 BLEND_WEIGHT_GEFS = 0.025
+BLEND_WEIGHT_METAR = 0.05  # METAR is observation, small weight for reality anchoring
 
 # ── Pipeline Settings ──────────────────────────────────────────────────────
 DATA_DIR = "data"

@@ -16,10 +16,16 @@ logger = logging.getLogger("current_conditions")
 NWS_OBS_URL = "https://api.weather.gov/stations/{icao}/observations"
 OPENMETEO_CURR_URL = "https://api.open-meteo.com/v1/forecast"
 OPENMETEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+# Weather.com API for international stations (used for METAR data)
+WEATHER_COM_INTL_URL = "https://api.weather.com/v1/location/{icao}:9:{country}/observations/current.json"
 
 
 def _celsius_to_fahrenheit(c: float) -> float:
     return c * 9 / 5 + 32
+
+
+def _fahrenheit_to_celsius(f: float) -> float:
+    return (f - 32) * 5 / 9
 
 
 async def _fetch_openmeteo_current(
@@ -213,16 +219,123 @@ async def _fetch_openmeteo_historical(
     }
 
 
+async def _fetch_metar_conditions(
+    icao: str,
+    target_local_date,
+    utc_offset: timedelta,
+    as_of_utc: datetime | None = None,
+) -> dict | None:
+    """
+    Fetch current conditions from Weather.com API for international METAR stations.
+
+    Returns same format as NWS: {current_temp_f, observed_high_f, observed_at}.
+    Uses Weather.com which provides METAR data for international stations.
+    """
+    from datetime import timezone as tz
+
+    # Determine country code from ICAO prefix
+    # RKSI -> KR (Korea)
+    country_map = {
+        "R": "KR",  # Korea
+        "Z": "CN",  # China
+        "V": "TH",  # Thailand
+        "WS": "SG", # Singapore
+        "WB": "MY", # Malaysia
+        "YM": "AU", # Australia
+        "NZ": "NZ", # New Zealand
+        "EG": "EG", # Egypt
+        "L": "FR",  # France/Germany/etc (Europe)
+        "E": "SE",  # Scandinavia
+        "K": "US",  # US (handled elsewhere)
+    }
+
+    # Get country code from first 1-2 characters of ICAO
+    country = "US"
+    if len(icao) >= 1:
+        prefix = icao[:1]
+        if prefix in country_map:
+            country = country_map[prefix]
+        elif len(icao) >= 2:
+            prefix2 = icao[:2]
+            if prefix2 in country_map:
+                country = country_map[prefix2]
+
+    url = WEATHER_COM_INTL_URL.format(icao=icao, country=country)
+    url_with_key = f"{url}?apiKey={config.WEATHER_COM_API_KEY}"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(url_with_key)
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.warning(f"METAR (Weather.com) fetch failed for {icao}: {e}")
+            return None
+
+    data = resp.json()
+    observation = data.get("observation", {})
+    # Temperature is in imperial object for international stations (Fahrenheit)
+    imperial = observation.get("imperial", {})
+    temp_f = imperial.get("temp")
+    # Get the observed high for the day (max temp in last 24 hours)
+    observed_high_f = imperial.get("temp_max_24hour")
+
+    if temp_f is None:
+        logger.warning("No temperature in Weather.com METAR response")
+        return None
+
+    # Convert to market's temperature unit
+    temp_c = _fahrenheit_to_celsius(temp_f)
+    temp_value = round(config.MARKET.celsius_to_unit(temp_c), 1)
+
+    if observed_high_f is not None:
+        observed_high_c = _fahrenheit_to_celsius(observed_high_f)
+        observed_high_value = round(config.MARKET.celsius_to_unit(observed_high_c), 1)
+    else:
+        observed_high_value = None
+
+    # Get the timestamp
+    obs_time_gmt = observation.get("obs_time")
+    if obs_time_gmt:
+        try:
+            obs_time = datetime.fromtimestamp(obs_time_gmt, tz=tz.utc)
+        except ValueError:
+            obs_time = datetime.now(tz.utc)
+    else:
+        obs_time = datetime.now(tz.utc)
+
+    # Check if this observation is for the target local date
+    obs_local_date = (obs_time + utc_offset).date()
+    if obs_local_date != target_local_date:
+        logger.warning(f"METAR observation {obs_time} is not for target date {target_local_date}")
+        return None
+
+    # For backtesting: skip observations after the as-of cutoff
+    if as_of_utc is not None and obs_time > as_of_utc:
+        logger.warning(f"METAR observation {obs_time} is after as_of_utc {as_of_utc}")
+        return None
+
+    u = config.MARKET.unit_symbol
+    logger.info(f"METAR (Weather.com): latest observation: {temp_value}{u} at {obs_time} UTC for {icao}")
+
+    return {
+        "current_temp_f": temp_value,
+        "observed_high_f": observed_high_value if observed_high_value is not None else temp_value,
+        "observed_high_time": obs_time,
+        "observed_at": obs_time,
+        "source": "metar",
+    }
+
+
 async def fetch_current_conditions(
     icao: str,
     as_of_utc: datetime | None = None,
 ) -> dict | None:
     """
-    Fetch current temperature and today's observed high from NWS (US) or
-    Open-Meteo (global fallback).
+    Fetch current temperature and today's observed high from NWS (US),
+    METAR (international), or Open-Meteo (global fallback).
 
     Args:
-        icao: Station ICAO code (e.g. "KDAL").
+        icao: Station ICAO code (e.g. "KDAL", "RKSI").
         as_of_utc: If set, only use observations at or before this UTC time.
                    Used by backtest.py to simulate a historical moment.
 
@@ -234,6 +347,8 @@ async def fetch_current_conditions(
         }
         or None if the fetch fails.
     """
+    market = config.MARKET
+
     # Try NWS first (US stations only)
     url = NWS_OBS_URL.format(icao=icao)
 
@@ -247,11 +362,25 @@ async def fetch_current_conditions(
                     features, as_of_utc
                 )
         except httpx.HTTPError as e:
-            logger.info(f"NWS observations fetch failed ({e}), trying Open-Meteo...")
+            logger.info(f"NWS observations fetch failed ({e}), trying METAR...")
+
+    # Try METAR for international stations (e.g., RKSI for Korea)
+    # METAR API supports stations worldwide via ICAO codes
+    metar_result = await _fetch_metar_conditions(
+        icao=icao,
+        target_local_date=market.target_date.date(),
+        utc_offset=market.utc_offset,
+        as_of_utc=as_of_utc,
+    )
+
+    if metar_result:
+        logger.info(f"Using METAR for current conditions: {icao}")
+        return metar_result
+    else:
+        logger.info(f"METAR fetch failed or unavailable for {icao}, falling back to Open-Meteo...")
 
     # Fallback to Open-Meteo for non-US stations (Korea, etc.)
     # First try to get historical hourly data to determine observed high
-    market = config.MARKET
 
     # Try archive API first to get observed_high_f
     result = await _fetch_openmeteo_historical(

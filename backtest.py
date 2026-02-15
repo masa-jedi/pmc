@@ -300,7 +300,7 @@ Markets: {', '.join(MARKETS.keys())}
 Examples:
   python backtest.py --date 2026-02-10 --as-of-local 12:00
   python backtest.py --date 2026-02-10 --as-of-local 12:00 --actual-high 73.9
-  python backtest.py --market seoul --date 2026-02-13 --as-of-local 12:00
+  python3 backtest.py --market seoul --date 2026-02-15 --as-of-local 11:00
         """,
     )
     parser.add_argument(
