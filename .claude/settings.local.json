@@ -1,11 +1,29 @@
 {
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "sk-cp-ZeWtNJwniV-RpDN56bOBW50H21m_bo0aO145yq9Raz7Haqh0NqT12RsY80JudSUBFT_E3bMFszEzhO7x4su2sSvaiIfO8NsgRPxKv01B_DcMWjOjFm9h1kw",
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "ANTHROPIC_MODEL": "MiniMax-M2.5",
+    "ANTHROPIC_SMALL_FAST_MODEL": "MiniMax-M2.5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "MiniMax-M2.5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "MiniMax-M2.5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "MiniMax-M2.5"
+  },
   "permissions": {
     "allow": [
       "Bash(python:*)",
       "Bash(curl:*)",
       "Bash(ls:*)",
       "Read(//root/masa/jedi/pmc/**)",
-      "Bash(xargs cat:*)"
+      "Bash(xargs cat:*)",
+      "Bash(python3:*)",
+      "Bash(for f in config.py probability_engine.py openmeteo_fetcher.py gfs_fetcher.py ecmwf_fetcher.py hrrr_fetcher.py nws_forecast_fetcher.py current_conditions.py)",
+      "Bash(do python3 -c \"import ast; ast.parse\\(open\\(''$f''\\).read\\(\\)\\)\")",
+      "Bash(echo:*)",
+      "Bash(done)",
+      "Bash(for f in config.py probability_engine.py openmeteo_fetcher.py gfs_fetcher.py ecmwf_fetcher.py hrrr_fetcher.py nws_forecast_fetcher.py current_conditions.py pipeline.py backtest.py)",
+      "WebFetch(domain:www.wunderground.com)"
     ]
   }
 }

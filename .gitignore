@@ -3,3 +3,7 @@ logs
 claude
 __pycache__
 qodo
+.claude
+.qodo
+.vscode
+.claude/*

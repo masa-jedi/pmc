@@ -9,6 +9,7 @@ runs the probability engine — as if you were making a prediction at that momen
 Usage:
     python backtest.py --date 2026-02-10 --as-of-local 12:00
     python backtest.py --date 2026-02-10 --as-of-local 12:00 --actual-high 73.9
+    python backtest.py --market seoul --date 2026-02-13 --as-of-local 12:00
 """
 
 import argparse
@@ -18,7 +19,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-from config import MARKET
+import config
+from config import MARKETS
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -30,8 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("backtest")
 
-STATION_UTC_OFFSET = timedelta(hours=-6)  # Dallas CST
-
 
 def _compute_available_cycles(as_of_utc: datetime) -> dict:
     """
@@ -40,8 +40,7 @@ def _compute_available_cycles(as_of_utc: datetime) -> dict:
 
     Returns dict with pin_cycle info for each fetcher.
     """
-    # HRRR: publishes ~30-45 min after cycle. At noon CST (18Z), the 17Z
-    # cycle is likely available. Grab last 4.
+    # HRRR: publishes ~30-45 min after cycle. Grab last 4.
     hrrr_cycles = []
     for hours_back in range(1, 13):
         check_time = as_of_utc - timedelta(hours=hours_back)
@@ -55,7 +54,7 @@ def _compute_available_cycles(as_of_utc: datetime) -> dict:
         check_time = as_of_utc - timedelta(hours=hours_back)
         cycle_hour = (check_time.hour // 6) * 6
         candidate = check_time.replace(hour=cycle_hour, minute=0, second=0, microsecond=0)
-        if candidate + timedelta(hours=6) <= as_of_utc:  # allow 6h for publication
+        if candidate + timedelta(hours=6) <= as_of_utc:
             gefs_cycle = (candidate.strftime("%Y%m%d"), f"{candidate.hour:02d}")
             break
 
@@ -94,127 +93,151 @@ async def run_backtest(
         format_distribution,
     )
 
+    market = config.MARKET
+    u = market.unit_symbol
+    sources = market.sources
+
     # Parse target date
     target_dt = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
-    # Compute as-of time in UTC
-    as_of_utc = target_dt.replace(hour=as_of_local_hour) - STATION_UTC_OFFSET
+    # Compute as-of time in UTC using market's UTC offset
+    as_of_utc = target_dt.replace(hour=as_of_local_hour) - market.utc_offset
     logger.info("=" * 70)
-    logger.info(f"BACKTEST: {MARKET.station.name} — {target_date}")
+    logger.info(f"BACKTEST: {market.station.name} — {target_date}")
     logger.info(f"  Simulating pipeline at {as_of_local_hour:02d}:00 local "
                 f"({as_of_utc.strftime('%H:%M')} UTC)")
+    logger.info(f"  Sources: {', '.join(sources)}")
     if actual_high is not None:
-        logger.info(f"  Actual high (ground truth): {actual_high}°F")
+        logger.info(f"  Actual high (ground truth): {actual_high}{u}")
     logger.info("=" * 70)
 
     # Determine which cycles would have been available
     cycles = _compute_available_cycles(as_of_utc)
     logger.info(f"\nAvailable cycles at {as_of_local_hour:02d}:00 local:")
-    logger.info(f"  HRRR:  {[f'{d}/{h}Z' for d, h in cycles['hrrr_cycles']]}")
-    logger.info(f"  GEFS:  {cycles['gefs_cycle'][0]}/{cycles['gefs_cycle'][1]}Z" if cycles['gefs_cycle'] else "  GEFS:  None")
-    logger.info(f"  ECMWF: {cycles['ecmwf_cycle'][0]}/{cycles['ecmwf_cycle'][1]}Z" if cycles['ecmwf_cycle'] else "  ECMWF: None")
+    if "hrrr" in sources:
+        logger.info(f"  HRRR:  {[f'{d}/{h}Z' for d, h in cycles['hrrr_cycles']]}")
+    if "gefs" in sources:
+        logger.info(f"  GEFS:  {cycles['gefs_cycle'][0]}/{cycles['gefs_cycle'][1]}Z" if cycles['gefs_cycle'] else "  GEFS:  None")
+    if "ecmwf" in sources:
+        logger.info(f"  ECMWF: {cycles['ecmwf_cycle'][0]}/{cycles['ecmwf_cycle'][1]}Z" if cycles['ecmwf_cycle'] else "  ECMWF: None")
 
     run_start = time.time()
+    step_count = len(sources) + 1  # +1 for observations
+    step = 0
 
     # ── Fetch HRRR with pinned cycles ──────────────────────────────
-    logger.info("\n[1/6] Fetching HRRR...")
-    t0 = time.time()
-    try:
-        hrrr_data = await fetch_hrrr_forecast(pin_cycles=cycles["hrrr_cycles"])
-        logger.info(
-            f"  HRRR: {len(hrrr_data['forecast_temps_f'])} cycles retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if hrrr_data["forecast_temps_f"]:
+    hrrr_data = {"forecast_temps_f": [], "member_details": {}}
+    if "hrrr" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching HRRR...")
+        t0 = time.time()
+        try:
+            hrrr_data = await fetch_hrrr_forecast(pin_cycles=cycles["hrrr_cycles"])
             logger.info(
-                f"  HRRR temps: min={min(hrrr_data['forecast_temps_f']):.1f}°F, "
-                f"max={max(hrrr_data['forecast_temps_f']):.1f}°F, "
-                f"mean={sum(hrrr_data['forecast_temps_f'])/len(hrrr_data['forecast_temps_f']):.1f}°F"
+                f"  HRRR: {len(hrrr_data['forecast_temps_f'])} cycles retrieved "
+                f"in {time.time() - t0:.1f}s"
             )
-    except Exception as e:
-        logger.error(f"  HRRR fetch failed: {e}")
-        hrrr_data = {"forecast_temps_f": [], "member_details": {}}
+            if hrrr_data["forecast_temps_f"]:
+                temps = hrrr_data["forecast_temps_f"]
+                logger.info(
+                    f"  HRRR temps: min={min(temps):.1f}{u}, "
+                    f"max={max(temps):.1f}{u}, "
+                    f"mean={sum(temps)/len(temps):.1f}{u}"
+                )
+        except Exception as e:
+            logger.error(f"  HRRR fetch failed: {e}")
 
     # ── Fetch GEFS with pinned cycle ───────────────────────────────
-    logger.info("\n[2/6] Fetching GEFS...")
-    t0 = time.time()
-    try:
-        gefs_data = await fetch_gefs_ensemble(pin_cycle=cycles["gefs_cycle"])
-        logger.info(
-            f"  GEFS: {len(gefs_data['forecast_temps_f'])} members retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if gefs_data["forecast_temps_f"]:
+    gefs_data = {"forecast_temps_f": [], "member_details": {}}
+    if "gefs" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching GEFS...")
+        t0 = time.time()
+        try:
+            gefs_data = await fetch_gefs_ensemble(pin_cycle=cycles["gefs_cycle"])
             logger.info(
-                f"  GEFS temps: min={min(gefs_data['forecast_temps_f']):.1f}°F, "
-                f"max={max(gefs_data['forecast_temps_f']):.1f}°F"
+                f"  GEFS: {len(gefs_data['forecast_temps_f'])} members retrieved "
+                f"in {time.time() - t0:.1f}s"
             )
-    except Exception as e:
-        logger.error(f"  GEFS fetch failed: {e}")
-        gefs_data = {"forecast_temps_f": [], "member_details": {}}
+            if gefs_data["forecast_temps_f"]:
+                temps = gefs_data["forecast_temps_f"]
+                logger.info(
+                    f"  GEFS temps: min={min(temps):.1f}{u}, "
+                    f"max={max(temps):.1f}{u}"
+                )
+        except Exception as e:
+            logger.error(f"  GEFS fetch failed: {e}")
 
     # ── Fetch ECMWF ────────────────────────────────────────────────
-    logger.info("\n[3/6] Fetching ECMWF...")
-    t0 = time.time()
-    try:
-        ecmwf_data = await fetch_ecmwf_ensemble(pin_cycle=cycles["ecmwf_cycle"])
-        logger.info(
-            f"  ECMWF: {len(ecmwf_data['forecast_temps_f'])} members retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if ecmwf_data["forecast_temps_f"]:
+    ecmwf_data = {"forecast_temps_f": [], "member_details": {}}
+    if "ecmwf" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching ECMWF...")
+        t0 = time.time()
+        try:
+            ecmwf_data = await fetch_ecmwf_ensemble(pin_cycle=cycles["ecmwf_cycle"])
             logger.info(
-                f"  ECMWF temps: min={min(ecmwf_data['forecast_temps_f']):.1f}°F, "
-                f"max={max(ecmwf_data['forecast_temps_f']):.1f}°F"
+                f"  ECMWF: {len(ecmwf_data['forecast_temps_f'])} members retrieved "
+                f"in {time.time() - t0:.1f}s"
             )
-    except Exception as e:
-        logger.error(f"  ECMWF fetch failed: {e}")
-        ecmwf_data = {"forecast_temps_f": [], "member_details": {}}
+            if ecmwf_data["forecast_temps_f"]:
+                temps = ecmwf_data["forecast_temps_f"]
+                logger.info(
+                    f"  ECMWF temps: min={min(temps):.1f}{u}, "
+                    f"max={max(temps):.1f}{u}"
+                )
+        except Exception as e:
+            logger.error(f"  ECMWF fetch failed: {e}")
 
     # ── Fetch NWS Point Forecast ───────────────────────────────────
-    logger.info("\n[4/6] Fetching NWS Point Forecast...")
-    t0 = time.time()
-    try:
-        nws_data = await fetch_nws_forecast()
-        logger.info(
-            f"  NWS: {len(nws_data['forecast_temps_f'])} forecast(s) retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if nws_data["forecast_temps_f"]:
-            logger.info(f"  NWS high: {nws_data['forecast_temps_f'][0]:.1f}°F")
-    except Exception as e:
-        logger.error(f"  NWS fetch failed: {e}")
-        nws_data = {"forecast_temps_f": [], "member_details": {}}
+    nws_data = {"forecast_temps_f": [], "member_details": {}}
+    if "nws" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching NWS Point Forecast...")
+        t0 = time.time()
+        try:
+            nws_data = await fetch_nws_forecast()
+            logger.info(
+                f"  NWS: {len(nws_data['forecast_temps_f'])} forecast(s) retrieved "
+                f"in {time.time() - t0:.1f}s"
+            )
+            if nws_data["forecast_temps_f"]:
+                logger.info(f"  NWS high: {nws_data['forecast_temps_f'][0]:.1f}{u}")
+        except Exception as e:
+            logger.error(f"  NWS fetch failed: {e}")
 
     # ── Fetch Open-Meteo Multi-Model ───────────────────────────────
-    logger.info("\n[5/6] Fetching Open-Meteo multi-model forecasts...")
-    t0 = time.time()
-    try:
-        openmeteo_data = await fetch_openmeteo_forecast()
-        logger.info(
-            f"  Open-Meteo: {len(openmeteo_data['forecast_temps_f'])} models retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if openmeteo_data["forecast_temps_f"]:
-            temps = openmeteo_data["forecast_temps_f"]
+    openmeteo_data = {"forecast_temps_f": [], "member_details": {}}
+    if "openmeteo" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching Open-Meteo multi-model forecasts...")
+        t0 = time.time()
+        try:
+            openmeteo_data = await fetch_openmeteo_forecast()
             logger.info(
-                f"  Open-Meteo temps: min={min(temps):.1f}°F, "
-                f"max={max(temps):.1f}°F, "
-                f"mean={sum(temps)/len(temps):.1f}°F"
+                f"  Open-Meteo: {len(openmeteo_data['forecast_temps_f'])} models retrieved "
+                f"in {time.time() - t0:.1f}s"
             )
-    except Exception as e:
-        logger.error(f"  Open-Meteo fetch failed: {e}")
-        openmeteo_data = {"forecast_temps_f": [], "member_details": {}}
+            if openmeteo_data["forecast_temps_f"]:
+                temps = openmeteo_data["forecast_temps_f"]
+                logger.info(
+                    f"  Open-Meteo temps: min={min(temps):.1f}{u}, "
+                    f"max={max(temps):.1f}{u}, "
+                    f"mean={sum(temps)/len(temps):.1f}{u}"
+                )
+        except Exception as e:
+            logger.error(f"  Open-Meteo fetch failed: {e}")
 
     # ── Fetch observations filtered to as-of time ──────────────────
-    logger.info("\n[6/6] Fetching observations (filtered to as-of time)...")
-    obs = await fetch_current_conditions(MARKET.station.icao, as_of_utc=as_of_utc)
+    step += 1
+    logger.info(f"\n[{step}/{step_count}] Fetching observations (filtered to as-of time)...")
+    obs = await fetch_current_conditions(market.station.icao, as_of_utc=as_of_utc)
 
     if obs:
         logger.info(
             f"  Obs as of {as_of_utc.strftime('%H:%M')} UTC: "
-            f"current={obs['current_temp_f']:.1f}°F, "
-            f"high so far={obs['observed_high_f']:.1f}°F"
+            f"current={obs['current_temp_f']:.1f}{u}, "
+            f"high so far={obs['observed_high_f']:.1f}{u}"
         )
 
     # ── Compute distribution ───────────────────────────────────────
@@ -244,7 +267,7 @@ async def run_backtest(
     if actual_high is not None:
         logger.info("")
         logger.info("=" * 70)
-        logger.info(f"  GROUND TRUTH: {actual_high}°F")
+        logger.info(f"  GROUND TRUTH: {actual_high}{u}")
 
         # Find which bucket the actual high falls into
         for bucket in distribution.buckets:
@@ -254,7 +277,7 @@ async def run_backtest(
                     f"(model gave {bucket.probability:.1%})"
                 )
                 break
-            elif bucket.upper_f >= MARKET.bucket_max_f and actual_high >= bucket.lower_f:
+            elif bucket.upper_f >= market.bucket_max and actual_high >= bucket.lower_f:
                 logger.info(
                     f"  Correct bucket: {bucket.label} "
                     f"(model gave {bucket.probability:.1%})"
@@ -271,11 +294,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Backtest: replay pipeline at a historical time",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+Markets: {', '.join(MARKETS.keys())}
+
 Examples:
   python backtest.py --date 2026-02-10 --as-of-local 12:00
   python backtest.py --date 2026-02-10 --as-of-local 12:00 --actual-high 73.9
+  python3 backtest.py --market seoul --date 2026-02-15 --as-of-local 11:00
         """,
+    )
+    parser.add_argument(
+        "--market", "-m",
+        choices=list(MARKETS.keys()),
+        default="dallas",
+        help="Target market (default: dallas)",
     )
     parser.add_argument(
         "--date", "-d",
@@ -285,15 +317,18 @@ Examples:
     parser.add_argument(
         "--as-of-local", "-t",
         required=True,
-        help="Local time to simulate (HH:MM, CST)",
+        help="Local time to simulate (HH:MM)",
     )
     parser.add_argument(
         "--actual-high", "-a",
         type=float,
-        help="Actual daily high for comparison (°F)",
+        help="Actual daily high for comparison",
     )
 
     args = parser.parse_args()
+
+    # Set active market BEFORE importing fetchers
+    config.set_market(args.market)
 
     # Parse local time
     as_of_local_hour = int(args.as_of_local.split(":")[0])

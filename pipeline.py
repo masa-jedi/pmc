@@ -3,45 +3,17 @@
 Weather Prediction Data Ingestion Pipeline
 ==========================================
 
-Pulls NOAA GFS ensemble (21 members) + ECMWF ensemble (51 members) every hour,
-converts raw forecasts into probability distributions across 2°F temperature buckets,
-and identifies arbitrage opportunities against Polymarket weather markets.
+Pulls ensemble forecasts from multiple NWP models, converts them into
+probability distributions across temperature buckets matching Polymarket
+weather markets, and identifies arbitrage opportunities.
 
-Target: Dallas Love Field Station (KDAL) — February 12, 2026
+Supports multiple markets (Dallas, Seoul, etc.) via --market flag.
 
 Usage:
-    # Single run
-    python pipeline.py
-
-    # Continuous (every hour)
-    python pipeline.py --continuous
-
-    # With live Polymarket prices
+    python pipeline.py                          # Dallas (default)
+    python pipeline.py --market seoul           # Seoul
+    python pipeline.py --continuous             # Run every hour
     python pipeline.py --polymarket-slug highest-temperature-in-dallas-on-february-12-2026
-
-    # With Polymarket prices from a file
-    python pipeline.py --prices prices.json
-
-Architecture:
-    ┌─────────────────┐    ┌──────────────────┐
-    │  NOAA NOMADS     │    │  ECMWF Open Data  │
-    │  GFS Ensemble    │    │  IFS Ensemble     │
-    │  (21 members)    │    │  (51 members)     │
-    └────────┬─────────┘    └────────┬──────────┘
-             │                       │
-             ▼                       ▼
-    ┌─────────────────────────────────────────┐
-    │         Probability Engine              │
-    │  KDE smoothing → 2°F bucket probs       │
-    │  Weighted combination (40% GFS / 60% EC)│
-    └────────────────┬────────────────────────┘
-                     │
-                     ▼
-    ┌─────────────────────────────────────────┐
-    │         Arbitrage Scanner               │
-    │  Model prob vs Polymarket prices        │
-    │  BUY NO when market > 3%, model < 1%   │
-    └─────────────────────────────────────────┘
 """
 
 import argparse
@@ -53,7 +25,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import DATA_DIR, FETCH_INTERVAL_SECONDS, LOG_DIR, MARKET
+import config
+from config import DATA_DIR, FETCH_INTERVAL_SECONDS, LOG_DIR, MARKETS
 
 # ── Logging Setup ──────────────────────────────────────────────────────────
 
@@ -85,14 +58,7 @@ async def run_pipeline(
     market_prices: dict | None = None,
     save_output: bool = True,
 ) -> dict:
-    """
-    Execute one full pipeline run:
-    1. Fetch GEFS ensemble data (21 members)
-    2. Fetch ECMWF ensemble data (51 members)
-    3. Compute probability distribution
-    4. Scan for arbitrage opportunities
-    5. Save results
-    """
+    """Execute one full pipeline run for the active market."""
     from gfs_fetcher import fetch_gefs_ensemble
     from ecmwf_fetcher import fetch_ecmwf_ensemble
     from hrrr_fetcher import fetch_hrrr_forecast
@@ -105,114 +71,144 @@ async def run_pipeline(
         find_arbitrage_opportunities,
         format_distribution,
     )
-    from current_conditions import fetch_current_conditions
+    from current_conditions import fetch_current_conditions, fetch_weather_conditions
+
+    market = config.MARKET
+    u = market.unit_symbol
+    sources = market.sources
 
     run_start = time.time()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     logger.info("=" * 70)
     logger.info(f"Pipeline run {run_id}")
-    logger.info(f"Target: {MARKET.station.name} — {MARKET.target_date.strftime('%B %d, %Y')}")
+    logger.info(f"Target: {market.station.name} — {market.target_date.strftime('%B %d, %Y')} ({u})")
+    logger.info(f"Sources: {', '.join(sources)}")
     logger.info("=" * 70)
 
-    # ── Step 1: Fetch GEFS ──────────────────────────────────────────
-    logger.info("\n[1/7] Fetching NOAA GFS Ensemble (21 members)...")
-    t0 = time.time()
-    try:
-        gefs_data = await fetch_gefs_ensemble()
-        logger.info(
-            f"  GEFS: {len(gefs_data['forecast_temps_f'])} members retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if gefs_data["forecast_temps_f"]:
+    # Count total steps based on available sources
+    step_count = len(sources) + 2  # +1 for observations, +1 for arbitrage
+    step = 0
+
+    # ── Fetch GEFS ──────────────────────────────────────────────────
+    gefs_data = {"forecast_temps_f": [], "member_details": {}}
+    if "gefs" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching NOAA GFS Ensemble (21 members)...")
+        t0 = time.time()
+        try:
+            gefs_data = await fetch_gefs_ensemble()
             logger.info(
-                f"  GEFS temps: min={min(gefs_data['forecast_temps_f']):.1f}°F, "
-                f"max={max(gefs_data['forecast_temps_f']):.1f}°F, "
-                f"mean={sum(gefs_data['forecast_temps_f'])/len(gefs_data['forecast_temps_f']):.1f}°F"
+                f"  GEFS: {len(gefs_data['forecast_temps_f'])} members retrieved "
+                f"in {time.time() - t0:.1f}s"
             )
-    except Exception as e:
-        logger.error(f"  GEFS fetch failed: {e}")
-        gefs_data = {"forecast_temps_f": [], "member_details": {}}
+            if gefs_data["forecast_temps_f"]:
+                temps = gefs_data["forecast_temps_f"]
+                logger.info(
+                    f"  GEFS temps: min={min(temps):.1f}{u}, "
+                    f"max={max(temps):.1f}{u}, "
+                    f"mean={sum(temps)/len(temps):.1f}{u}"
+                )
+        except Exception as e:
+            logger.error(f"  GEFS fetch failed: {e}")
 
-    # ── Step 2: Fetch HRRR ─────────────────────────────────────────
-    logger.info("\n[2/7] Fetching NOAA HRRR (last 4 cycles)...")
-    t0 = time.time()
-    try:
-        hrrr_data = await fetch_hrrr_forecast()
-        logger.info(
-            f"  HRRR: {len(hrrr_data['forecast_temps_f'])} cycles retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if hrrr_data["forecast_temps_f"]:
+    # ── Fetch HRRR ──────────────────────────────────────────────────
+    hrrr_data = {"forecast_temps_f": [], "member_details": {}}
+    if "hrrr" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching NOAA HRRR (last 4 cycles)...")
+        t0 = time.time()
+        try:
+            hrrr_data = await fetch_hrrr_forecast()
             logger.info(
-                f"  HRRR temps: min={min(hrrr_data['forecast_temps_f']):.1f}°F, "
-                f"max={max(hrrr_data['forecast_temps_f']):.1f}°F, "
-                f"mean={sum(hrrr_data['forecast_temps_f'])/len(hrrr_data['forecast_temps_f']):.1f}°F"
+                f"  HRRR: {len(hrrr_data['forecast_temps_f'])} cycles retrieved "
+                f"in {time.time() - t0:.1f}s"
             )
-    except Exception as e:
-        logger.error(f"  HRRR fetch failed: {e}")
-        hrrr_data = {"forecast_temps_f": [], "member_details": {}}
+            if hrrr_data["forecast_temps_f"]:
+                temps = hrrr_data["forecast_temps_f"]
+                logger.info(
+                    f"  HRRR temps: min={min(temps):.1f}{u}, "
+                    f"max={max(temps):.1f}{u}, "
+                    f"mean={sum(temps)/len(temps):.1f}{u}"
+                )
+        except Exception as e:
+            logger.error(f"  HRRR fetch failed: {e}")
 
-    # ── Step 3: Fetch ECMWF ─────────────────────────────────────────
-    logger.info("\n[3/7] Fetching ECMWF Ensemble (51 members)...")
-    t0 = time.time()
-    try:
-        ecmwf_data = await fetch_ecmwf_ensemble()
-        logger.info(
-            f"  ECMWF: {len(ecmwf_data['forecast_temps_f'])} members retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if ecmwf_data["forecast_temps_f"]:
+    # ── Fetch ECMWF ──────────────────────────────────────────────────
+    ecmwf_data = {"forecast_temps_f": [], "member_details": {}}
+    if "ecmwf" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching ECMWF Ensemble (51 members)...")
+        t0 = time.time()
+        try:
+            ecmwf_data = await fetch_ecmwf_ensemble()
             logger.info(
-                f"  ECMWF temps: min={min(ecmwf_data['forecast_temps_f']):.1f}°F, "
-                f"max={max(ecmwf_data['forecast_temps_f']):.1f}°F"
+                f"  ECMWF: {len(ecmwf_data['forecast_temps_f'])} members retrieved "
+                f"in {time.time() - t0:.1f}s"
             )
-        if ecmwf_data.get("hres_forecast_f"):
-            logger.info(f"  ECMWF HRES (deterministic): {ecmwf_data['hres_forecast_f']}°F")
-    except Exception as e:
-        logger.error(f"  ECMWF fetch failed: {e}")
-        ecmwf_data = {"forecast_temps_f": [], "member_details": {}}
+            if ecmwf_data["forecast_temps_f"]:
+                temps = ecmwf_data["forecast_temps_f"]
+                logger.info(
+                    f"  ECMWF temps: min={min(temps):.1f}{u}, "
+                    f"max={max(temps):.1f}{u}"
+                )
+            if ecmwf_data.get("hres_forecast_f"):
+                logger.info(f"  ECMWF HRES (deterministic): {ecmwf_data['hres_forecast_f']}{u}")
+        except Exception as e:
+            logger.error(f"  ECMWF fetch failed: {e}")
 
-    # ── Step 4: Fetch NWS Point Forecast ────────────────────────────
-    logger.info("\n[4/7] Fetching NWS Point Forecast...")
-    t0 = time.time()
-    try:
-        nws_data = await fetch_nws_forecast()
-        logger.info(
-            f"  NWS: {len(nws_data['forecast_temps_f'])} forecast(s) retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if nws_data["forecast_temps_f"]:
-            logger.info(f"  NWS high: {nws_data['forecast_temps_f'][0]:.1f}°F")
-    except Exception as e:
-        logger.error(f"  NWS fetch failed: {e}")
-        nws_data = {"forecast_temps_f": [], "member_details": {}}
-
-    # ── Step 5: Fetch Open-Meteo Multi-Model ─────────────────────────
-    logger.info("\n[5/7] Fetching Open-Meteo multi-model forecasts...")
-    t0 = time.time()
-    try:
-        openmeteo_data = await fetch_openmeteo_forecast()
-        logger.info(
-            f"  Open-Meteo: {len(openmeteo_data['forecast_temps_f'])} models retrieved "
-            f"in {time.time() - t0:.1f}s"
-        )
-        if openmeteo_data["forecast_temps_f"]:
-            temps = openmeteo_data["forecast_temps_f"]
+    # ── Fetch NWS Point Forecast ────────────────────────────────────
+    nws_data = {"forecast_temps_f": [], "member_details": {}}
+    if "nws" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching NWS Point Forecast...")
+        t0 = time.time()
+        try:
+            nws_data = await fetch_nws_forecast()
             logger.info(
-                f"  Open-Meteo temps: min={min(temps):.1f}°F, "
-                f"max={max(temps):.1f}°F, "
-                f"mean={sum(temps)/len(temps):.1f}°F"
+                f"  NWS: {len(nws_data['forecast_temps_f'])} forecast(s) retrieved "
+                f"in {time.time() - t0:.1f}s"
             )
-    except Exception as e:
-        logger.error(f"  Open-Meteo fetch failed: {e}")
-        openmeteo_data = {"forecast_temps_f": [], "member_details": {}}
+            if nws_data["forecast_temps_f"]:
+                logger.info(f"  NWS high: {nws_data['forecast_temps_f'][0]:.1f}{u}")
+        except Exception as e:
+            logger.error(f"  NWS fetch failed: {e}")
 
-    # ── Step 6: Fetch observations & compute probability distribution ──
-    logger.info("\n[6/7] Fetching observations & computing probabilities...")
+    # ── Fetch Open-Meteo Multi-Model ────────────────────────────────
+    openmeteo_data = {"forecast_temps_f": [], "member_details": {}}
+    if "openmeteo" in sources:
+        step += 1
+        logger.info(f"\n[{step}/{step_count}] Fetching Open-Meteo multi-model forecasts...")
+        t0 = time.time()
+        try:
+            openmeteo_data = await fetch_openmeteo_forecast()
+            logger.info(
+                f"  Open-Meteo: {len(openmeteo_data['forecast_temps_f'])} models retrieved "
+                f"in {time.time() - t0:.1f}s"
+            )
+            if openmeteo_data["forecast_temps_f"]:
+                temps = openmeteo_data["forecast_temps_f"]
+                logger.info(
+                    f"  Open-Meteo temps: min={min(temps):.1f}{u}, "
+                    f"max={max(temps):.1f}{u}, "
+                    f"mean={sum(temps)/len(temps):.1f}{u}"
+                )
+        except Exception as e:
+            logger.error(f"  Open-Meteo fetch failed: {e}")
+
+    # ── Fetch observations & compute probability distribution ──────
+    step += 1
+    logger.info(f"\n[{step}/{step_count}] Fetching observations & computing probabilities...")
     t0 = time.time()
 
-    obs = await fetch_current_conditions(MARKET.station.icao)
+    obs = await fetch_current_conditions(market.station.icao)
+
+    # Fetch weather conditions (precipitation, thunder, storm)
+    weather_conditions = await fetch_weather_conditions(
+        market.station.icao,
+        market.target_date,
+    )
+
     if obs:
         distribution = apply_reality_check(
             gefs_data,
@@ -224,6 +220,7 @@ async def run_pipeline(
             hrrr_data=hrrr_data,
             nws_data=nws_data,
             openmeteo_data=openmeteo_data,
+            weather_conditions=weather_conditions,
         )
     else:
         logger.warning("  No current observations — using pure forecast (no bias correction)")
@@ -236,8 +233,9 @@ async def run_pipeline(
     logger.info(f"\n{output}")
     logger.info(f"  Computed in {time.time() - t0:.3f}s")
 
-    # ── Step 7: Arbitrage scan ──────────────────────────────────────
-    logger.info("\n[7/7] Scanning for arbitrage opportunities...")
+    # ── Arbitrage scan ──────────────────────────────────────────────
+    step += 1
+    logger.info(f"\n[{step}/{step_count}] Scanning for arbitrage opportunities...")
     opportunities = find_arbitrage_opportunities(distribution, market_prices)
 
     if not opportunities:
@@ -262,50 +260,41 @@ async def run_pipeline(
         results = {
             "run_id": run_id,
             "target": {
-                "station": MARKET.station.name,
-                "icao": MARKET.station.icao,
-                "date": MARKET.target_date.isoformat(),
-                "lat": MARKET.station.lat,
-                "lon": MARKET.station.lon,
+                "station": market.station.name,
+                "icao": market.station.icao,
+                "date": market.target_date.isoformat(),
+                "unit": market.unit,
+                "lat": market.station.lat,
+                "lon": market.station.lon,
             },
             "gefs": {
                 "cycle": gefs_data.get("cycle"),
                 "member_count": len(gefs_data["forecast_temps_f"]),
-                "temps_f": gefs_data["forecast_temps_f"],
-            },
-            "hrrr": {
-                "cycle": hrrr_data.get("cycle"),
-                "cycle_count": len(hrrr_data["forecast_temps_f"]),
-                "temps_f": hrrr_data["forecast_temps_f"],
+                "temps": gefs_data["forecast_temps_f"],
             },
             "ecmwf": {
                 "cycle": ecmwf_data.get("cycle"),
                 "member_count": len(ecmwf_data["forecast_temps_f"]),
-                "temps_f": ecmwf_data["forecast_temps_f"],
-                "hres_f": ecmwf_data.get("hres_forecast_f"),
-            },
-            "nws": {
-                "forecast_count": len(nws_data["forecast_temps_f"]),
-                "temps_f": nws_data["forecast_temps_f"],
-                "details": nws_data.get("member_details", {}),
+                "temps": ecmwf_data["forecast_temps_f"],
+                "hres": ecmwf_data.get("hres_forecast_f"),
             },
             "openmeteo": {
                 "model_count": len(openmeteo_data["forecast_temps_f"]),
-                "temps_f": openmeteo_data["forecast_temps_f"],
+                "temps": openmeteo_data["forecast_temps_f"],
                 "models": openmeteo_data.get("member_details", {}),
             },
             "distribution": {
                 "method": distribution.method,
-                "ensemble_mean_f": distribution.ensemble_mean_f,
-                "ensemble_std_f": distribution.ensemble_std_f,
+                "ensemble_mean": distribution.ensemble_mean_f,
+                "ensemble_std": distribution.ensemble_std_f,
                 "total_members": distribution.total_members,
                 "most_likely_bucket": distribution.most_likely_bucket,
                 "most_likely_prob": distribution.most_likely_prob,
                 "buckets": [
                     {
                         "label": b.label,
-                        "lower_f": b.lower_f,
-                        "upper_f": b.upper_f,
+                        "lower": b.lower_f,
+                        "upper": b.upper_f,
                         "probability": round(b.probability, 6),
                         "gefs_prob": round(b.gefs_prob, 6),
                         "ecmwf_prob": round(b.ecmwf_prob, 6),
@@ -318,6 +307,20 @@ async def run_pipeline(
             "arbitrage": opportunities,
             "elapsed_seconds": round(time.time() - run_start, 1),
         }
+
+        # Include optional sources in output
+        if "hrrr" in sources:
+            results["hrrr"] = {
+                "cycle": hrrr_data.get("cycle"),
+                "cycle_count": len(hrrr_data["forecast_temps_f"]),
+                "temps": hrrr_data["forecast_temps_f"],
+            }
+        if "nws" in sources:
+            results["nws"] = {
+                "forecast_count": len(nws_data["forecast_temps_f"]),
+                "temps": nws_data["forecast_temps_f"],
+                "details": nws_data.get("member_details", {}),
+            }
 
         output_file.write_text(json.dumps(results, indent=2))
         logger.info(f"\nResults saved to {output_file}")
@@ -345,7 +348,6 @@ async def run_continuous(
         logger.info(f"{'━' * 70}")
 
         try:
-            # Re-fetch live prices each iteration so they stay current
             prices = market_prices
             if polymarket_slug:
                 from polymarket_scraper import fetch_polymarket_prices
@@ -364,16 +366,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Weather Prediction Data Ingestion Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+Markets: {', '.join(MARKETS.keys())}
+
 Examples:
-  python pipeline.py                          # Single run
+  python pipeline.py                          # Dallas (default)
+  python pipeline.py --market seoul           # Seoul
   python pipeline.py --continuous             # Run every hour
-  python pipeline.py --continuous --interval 1800  # Run every 30 min
   python pipeline.py --prices prices.json     # Compare against Polymarket
   python pipeline.py -v                       # Verbose logging
         """,
     )
 
+    parser.add_argument(
+        "--market", "-m",
+        choices=list(MARKETS.keys()),
+        default="dallas",
+        help="Target market (default: dallas)",
+    )
     parser.add_argument(
         "--continuous", "-c",
         action="store_true",
@@ -388,7 +398,7 @@ Examples:
     parser.add_argument(
         "--polymarket-slug", "-pm",
         type=str,
-        help="Event slug to fetch live Polymarket prices (e.g. highest-temperature-in-dallas-on-february-12-2026)",
+        help="Event slug to fetch live Polymarket prices",
     )
     parser.add_argument(
         "--prices", "-p",
@@ -402,9 +412,13 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Set active market BEFORE importing fetchers (they bind config.MARKET at import)
+    config.set_market(args.market)
+
     setup_logging(verbose=args.verbose)
 
-    # Load market prices: live slug takes priority over static file
+    # Load market prices
     market_prices = None
     if args.polymarket_slug:
         from polymarket_scraper import fetch_polymarket_prices

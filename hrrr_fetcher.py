@@ -18,11 +18,11 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+import config
 from config import (
     HRRR_BASE_URL,
     HRRR_N_CYCLES,
     HTTP_TIMEOUT_SECONDS,
-    MARKET,
     MAX_RETRIES,
     RETRY_DELAY_SECONDS,
 )
@@ -61,10 +61,10 @@ def _find_latest_hrrr_cycles(
             f"&var_TMP=on"
             f"&lev_2_m_above_ground=on"
             f"&subregion="
-            f"&toplat={MARKET.station.lat + 0.25}"
-            f"&leftlon={360 + MARKET.station.lon}"
-            f"&rightlon={360 + MARKET.station.lon + 0.25}"
-            f"&bottomlat={MARKET.station.lat - 0.25}"
+            f"&toplat={config.MARKET.station.lat + 0.25}"
+            f"&leftlon={config.MARKET.station.lon % 360}"
+            f"&rightlon={(config.MARKET.station.lon % 360) + 0.25}"
+            f"&bottomlat={config.MARKET.station.lat - 0.25}"
         )
         try:
             resp = client.head(test_url, timeout=15)
@@ -86,7 +86,7 @@ def _compute_hrrr_hours(cycle_date: str, cycle_hour: str) -> list[int]:
     cycle_dt = datetime.strptime(f"{cycle_date}{cycle_hour}", "%Y%m%d%H").replace(
         tzinfo=timezone.utc
     )
-    target = MARKET.target_date
+    target = config.MARKET.target_date
 
     # Cover 6 AM CST (12Z) to midnight CST (06Z next day)
     target_start = target.replace(hour=12)
@@ -206,10 +206,10 @@ async def fetch_hrrr_forecast(
                     f"&var_TMP=on"
                     f"&lev_2_m_above_ground=on"
                     f"&subregion="
-                    f"&toplat={MARKET.station.lat + 0.25}"
-                    f"&leftlon={360 + MARKET.station.lon}"
-                    f"&rightlon={360 + MARKET.station.lon + 0.25}"
-                    f"&bottomlat={MARKET.station.lat - 0.25}"
+                    f"&toplat={config.MARKET.station.lat + 0.25}"
+                    f"&leftlon={config.MARKET.station.lon % 360}"
+                    f"&rightlon={(config.MARKET.station.lon % 360) + 0.25}"
+                    f"&bottomlat={config.MARKET.station.lat - 0.25}"
                 )
 
                 for attempt in range(MAX_RETRIES):
@@ -218,11 +218,11 @@ async def fetch_hrrr_forecast(
                         if resp.status_code == 200 and len(resp.content) > 50:
                             temp_k = _parse_grib2_temperature(
                                 resp.content,
-                                MARKET.station.lat,
-                                MARKET.station.lon,
+                                config.MARKET.station.lat,
+                                config.MARKET.station.lon,
                             )
                             if temp_k:
-                                temp_f = kelvin_to_fahrenheit(temp_k)
+                                temp_f = config.MARKET.kelvin_to_unit(temp_k)
                                 cycle_temps[fh] = round(temp_f, 1)
                                 logger.debug(
                                     f"  HRRR {cycle_label} f{fh:02d}: {temp_f:.1f}°F"

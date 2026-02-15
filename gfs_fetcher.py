@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import numpy as np
 
+import config
 from config import (
     DATA_DIR,
     GEFS_ALL_MEMBERS,
@@ -23,12 +24,16 @@ from config import (
     GEFS_LEVEL,
     GEFS_VARIABLE,
     HTTP_TIMEOUT_SECONDS,
-    MARKET,
     MAX_RETRIES,
     RETRY_DELAY_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _nomads_lon(lon: float) -> float:
+    """Convert longitude to NOMADS 0-360 range."""
+    return lon % 360
 
 
 def kelvin_to_fahrenheit(k: float) -> float:
@@ -63,10 +68,10 @@ def _find_latest_available_cycle(client: httpx.Client) -> tuple[str, str] | None
                 f"&var_{GEFS_VARIABLE}=on"
                 f"&lev_{GEFS_LEVEL}=on"
                 f"&subregion="
-                f"&toplat={MARKET.station.lat + 0.5}"
-                f"&leftlon={360 + MARKET.station.lon}"  # NOMADS uses 0-360
-                f"&rightlon={360 + MARKET.station.lon + 0.5}"
-                f"&bottomlat={MARKET.station.lat - 0.5}"
+                f"&toplat={config.MARKET.station.lat + 0.5}"
+                f"&leftlon={_nomads_lon(config.MARKET.station.lon)}"  # NOMADS uses 0-360
+                f"&rightlon={_nomads_lon(config.MARKET.station.lon) + 0.5}"
+                f"&bottomlat={config.MARKET.station.lat - 0.5}"
             )
             try:
                 resp = client.head(test_url, timeout=15)
@@ -82,19 +87,19 @@ def _find_latest_available_cycle(client: httpx.Client) -> tuple[str, str] | None
 def _compute_forecast_hours(cycle_date: str, cycle_hour: str) -> list[int]:
     """
     Compute which forecast hours cover the target date's daytime (for max temp).
-    Dallas local = UTC-6. We want to cover ~06:00 to 23:59 local = 12Z to 05Z+1.
+    Covers local 06:00 to midnight based on market UTC offset.
     """
     cycle_dt = datetime.strptime(f"{cycle_date}{cycle_hour}", "%Y%m%d%H").replace(
         tzinfo=timezone.utc
     )
-    target = MARKET.target_date
+    market = config.MARKET
+    target = market.target_date
 
-    # We want forecast valid times covering Feb 12 12:00 UTC through Feb 13 06:00 UTC
-    # (that's Feb 12 06:00 CST through Feb 12 23:59 CST — when max temp occurs)
-    target_start = target.replace(hour=12)  # 12Z = 6AM CST
-    target_end = target.replace(hour=23, minute=59)  # ~6PM CST is usually max
-    # Extend to capture late afternoon
-    target_end_utc = target + timedelta(hours=30)  # Feb 13 06Z
+    # Cover local 06:00 to midnight → convert to UTC using market offset
+    # local 06:00 = UTC 06:00 - offset_hours
+    local_start_utc = 6 - market.utc_offset_hours  # e.g., Dallas: 6-(-6)=12Z, Seoul: 6-9=-3→21Z prev day
+    target_start = target.replace(hour=0) + timedelta(hours=local_start_utc)
+    target_end_utc = target.replace(hour=0) + timedelta(hours=24 - market.utc_offset_hours + 6)
 
     hours = []
     # GEFS forecast hours: 0-240 every 3h, then 240-384 every 6h
@@ -219,10 +224,10 @@ async def fetch_gefs_ensemble(
                     f"&var_{GEFS_VARIABLE}=on"
                     f"&lev_{GEFS_LEVEL}=on"
                     f"&subregion="
-                    f"&toplat={MARKET.station.lat + 0.25}"
-                    f"&leftlon={360 + MARKET.station.lon}"
-                    f"&rightlon={360 + MARKET.station.lon + 0.25}"
-                    f"&bottomlat={MARKET.station.lat - 0.25}"
+                    f"&toplat={config.MARKET.station.lat + 0.25}"
+                    f"&leftlon={_nomads_lon(config.MARKET.station.lon)}"
+                    f"&rightlon={_nomads_lon(config.MARKET.station.lon) + 0.25}"
+                    f"&bottomlat={config.MARKET.station.lat - 0.25}"
                 )
 
                 for attempt in range(MAX_RETRIES):
@@ -231,11 +236,11 @@ async def fetch_gefs_ensemble(
                         if resp.status_code == 200 and len(resp.content) > 50:
                             temp_k = _parse_grib2_temperature(
                                 resp.content,
-                                MARKET.station.lat,
-                                MARKET.station.lon,
+                                config.MARKET.station.lat,
+                                config.MARKET.station.lon,
                             )
                             if temp_k:
-                                temp_f = kelvin_to_fahrenheit(temp_k)
+                                temp_f = config.MARKET.kelvin_to_unit(temp_k)
                                 member_temps[fh] = round(temp_f, 1)
                                 logger.debug(
                                     f"  {member} f{fh:03d}: {temp_f:.1f}°F"
@@ -336,12 +341,12 @@ def fetch_gefs_with_cfgrib() -> dict:
                     )
                     temp_k = float(
                         ds["t2m"].sel(
-                            latitude=MARKET.station.lat,
-                            longitude=360 + MARKET.station.lon,
+                            latitude=config.MARKET.station.lat,
+                            longitude=_nomads_lon(config.MARKET.station.lon),
                             method="nearest",
                         ).values
                     )
-                    temp_f = kelvin_to_fahrenheit(temp_k)
+                    temp_f = config.MARKET.kelvin_to_unit(temp_k)
                     member_temps[fh] = round(temp_f, 1)
             except Exception as e:
                 logger.debug(f"cfgrib failed for {member} f{fh:03d}: {e}")
