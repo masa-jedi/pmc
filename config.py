@@ -66,7 +66,7 @@ INCHEON_INTL = StationConfig(
 # ── Markets ────────────────────────────────────────────────────────────────
 MARKET_DALLAS = TargetMarket(
     station=DALLAS_LOVE_FIELD,
-    target_date=datetime(2026, 2, 14, tzinfo=timezone.utc),
+    target_date=datetime(2026, 2, 16, tzinfo=timezone.utc),
     bucket_width=2,
     bucket_min=58,    # Regular buckets: 70-71, 72-73, ..., 78-79
     bucket_max=75,    # Last bucket: "80°F or higher"

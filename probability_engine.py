@@ -70,18 +70,19 @@ class ProbabilityDistribution:
 
 def _renormalize(dist: ProbabilityDistribution) -> ProbabilityDistribution:
     """Renormalize probabilities to sum to 1.0 after some buckets are invalidated."""
-    # Normalize combined probability
+    # Get current total before normalization
     total = sum(b.probability for b in dist.buckets)
     if total > 0 and total != 1.0:
+        # Scale factor to normalize combined probability
+        scale = 1.0 / total
         for bucket in dist.buckets:
-            bucket.probability /= total
-
-    # Normalize each model's probabilities independently
-    for model in ["gefs", "ecmwf", "hrrr", "nws", "openmeteo"]:
-        model_total = sum(getattr(b, f"{model}_prob") for b in dist.buckets)
-        if model_total > 0 and model_total != 1.0:
-            for bucket in dist.buckets:
-                setattr(bucket, f"{model}_prob", getattr(bucket, f"{model}_prob") / model_total)
+            bucket.probability *= scale
+            # Apply same scale to model probabilities so sum matches combined
+            bucket.gefs_prob *= scale
+            bucket.ecmwf_prob *= scale
+            bucket.hrrr_prob *= scale
+            bucket.nws_prob *= scale
+            bucket.openmeteo_prob *= scale
 
     return dist
 
@@ -288,24 +289,46 @@ def compute_distribution(
             + openmeteo_buckets[i].member_count
         )
 
-    # Normalize combined
+    # Save raw model probabilities before normalization
+    raw_model_probs = []
+    for i, b in enumerate(combined_buckets):
+        raw_model_probs.append({
+            "gefs": gefs_buckets[i].probability if gefs_temps else 0.0,
+            "ecmwf": ecmwf_buckets[i].probability if ecmwf_temps else 0.0,
+            "hrrr": hrrr_buckets[i].probability if hrrr_temps else 0.0,
+            "nws": nws_buckets[i].probability if nws_temps else 0.0,
+            "openmeteo": openmeteo_buckets[i].probability if openmeteo_temps else 0.0,
+        })
+
+    # Normalize combined probability
     total_prob = sum(b.probability for b in combined_buckets)
     if total_prob > 0:
         for b in combined_buckets:
             b.probability /= total_prob
 
-    # Also normalize individual model probabilities so they sum to 100%
-    for model_probs, model_buckets in [
-        ("gefs", gefs_buckets),
-        ("ecmwf", ecmwf_buckets),
-        ("hrrr", hrrr_buckets),
-        ("nws", nws_buckets),
-        ("openmeteo", openmeteo_buckets),
-    ]:
-        total_model_prob = sum(b.probability for b in model_buckets)
-        if total_model_prob > 0:
-            for i, b in enumerate(combined_buckets):
-                setattr(b, f"{model_probs}_prob", model_buckets[i].probability / total_model_prob)
+    # Compute each model's weighted contribution so sum of models = combined prob
+    for i, b in enumerate(combined_buckets):
+        raw = raw_model_probs[i]
+        if gefs_temps:
+            b.gefs_prob = gefs_weight * raw["gefs"] / total_prob if total_prob > 0 else 0.0
+        else:
+            b.gefs_prob = 0.0
+        if ecmwf_temps:
+            b.ecmwf_prob = ecmwf_weight * raw["ecmwf"] / total_prob if total_prob > 0 else 0.0
+        else:
+            b.ecmwf_prob = 0.0
+        if hrrr_temps:
+            b.hrrr_prob = hrrr_weight * raw["hrrr"] / total_prob if total_prob > 0 else 0.0
+        else:
+            b.hrrr_prob = 0.0
+        if nws_temps:
+            b.nws_prob = nws_weight * raw["nws"] / total_prob if total_prob > 0 else 0.0
+        else:
+            b.nws_prob = 0.0
+        if openmeteo_temps:
+            b.openmeteo_prob = openmeteo_weight * raw["openmeteo"] / total_prob if total_prob > 0 else 0.0
+        else:
+            b.openmeteo_prob = 0.0
 
     # ── Aggregate statistics ────────────────────────────────────────
     all_temps = np.array(gefs_temps + ecmwf_temps + hrrr_temps + nws_temps + openmeteo_temps)
@@ -657,31 +680,18 @@ def apply_reality_check(
                 bucket.openmeteo_prob *= weather_discount
 
     # ── 5. Renormalize ───────────────────────────────────────────────────────
+    # Apply the same scale factor to combined and all model probabilities
+    # so that sum of models equals combined probability
     total_combined = sum(b.probability for b in dist.buckets)
-    total_gefs = sum(b.gefs_prob for b in dist.buckets)
-    total_ecmwf = sum(b.ecmwf_prob for b in dist.buckets)
-    total_hrrr = sum(b.hrrr_prob for b in dist.buckets)
-    total_nws = sum(b.nws_prob for b in dist.buckets)
-    total_openmeteo = sum(b.openmeteo_prob for b in dist.buckets)
-
     if total_combined > 0:
+        scale = 1.0 / total_combined
         for b in dist.buckets:
-            b.probability /= total_combined
-    if total_gefs > 0:
-        for b in dist.buckets:
-            b.gefs_prob /= total_gefs
-    if total_ecmwf > 0:
-        for b in dist.buckets:
-            b.ecmwf_prob /= total_ecmwf
-    if total_hrrr > 0:
-        for b in dist.buckets:
-            b.hrrr_prob /= total_hrrr
-    if total_nws > 0:
-        for b in dist.buckets:
-            b.nws_prob /= total_nws
-    if total_openmeteo > 0:
-        for b in dist.buckets:
-            b.openmeteo_prob /= total_openmeteo
+            b.probability *= scale
+            b.gefs_prob *= scale
+            b.ecmwf_prob *= scale
+            b.hrrr_prob *= scale
+            b.nws_prob *= scale
+            b.openmeteo_prob *= scale
 
     # Update summary stats (ensemble stats already reflect shifted temps from compute_distribution)
     best_bucket = max(dist.buckets, key=lambda b: b.probability)
