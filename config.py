@@ -66,14 +66,14 @@ INCHEON_INTL = StationConfig(
 # ── Markets ────────────────────────────────────────────────────────────────
 MARKET_DALLAS = TargetMarket(
     station=DALLAS_LOVE_FIELD,
-    target_date=datetime(2026, 2, 14, tzinfo=timezone.utc),
+    target_date=datetime(2026, 2, 15, tzinfo=timezone.utc),
     bucket_width=2,
-    bucket_min=54,    # Regular buckets: 70-71, 72-73, ..., 78-79
-    bucket_max=71,    # Last bucket: "80°F or higher"
+    bucket_min=52,    # Regular buckets: 70-71, 72-73, ..., 78-79
+    bucket_max=69,    # Last bucket: "80°F or higher"
     unit="F",
     utc_offset_hours=-6,
     timezone_str="America/Chicago",
-    sources=("gefs", "ecmwf", "hrrr", "nws", "openmeteo"),
+    sources=("gefs", "ecmwf", "hrrr", "nws", "openmeteo", "metar"),  # taf excluded: no temp in TAF
 )
 
 MARKET_SEOUL = TargetMarket(
@@ -142,6 +142,8 @@ BLEND_WEIGHT_OPENMETEO = 0.55
 BLEND_WEIGHT_ECMWF = 0.025
 BLEND_WEIGHT_GEFS = 0.025
 BLEND_WEIGHT_METAR = 0.05  # METAR is observation, small weight for reality anchoring
+BLEND_WEIGHT_TAF = 0.05    # TAF provides forecast guidance
+BLEND_WEIGHT_LAMP = 0.05   # LAMP provides hourly guidance
 
 # ── Pipeline Settings ──────────────────────────────────────────────────────
 DATA_DIR = "data"
@@ -154,7 +156,13 @@ HTTP_TIMEOUT_SECONDS = 60
 # ── Weather.com Configuration ────────────────────────────────────────────────
 # Historical observations API for US stations
 WEATHER_COM_API_KEY = "e1f10a1e78da46f5b10a1e78da96f525"
-WEATHER_COM_BASE_URL = "https://api.weather.com/v1/location/{icao}:9:US/observations/historical.json"
+WEATHER_COM_BASE_URL = "https://api.weather.com/v1/location/{icao}:9_US/observations/historical.json"
+
+# ── NOAA AWC (Aviation Weather Center) Configuration ────────────────────────
+# TAF: Terminal Aerodrome Forecast (24-30 hour forecasts)
+TAF_BASE_URL = "https://aviationweather.gov/api/data/taf"
+# LAMP: Local Aviation Model for Planning (hourly guidance)
+LAMP_BASE_URL = "https://aviationweather.gov/api/data/lamp"
 
 # ── Probability Engine ──────────────────────────────────────────────────────
 # Kernel Density Estimation bandwidth for smoothing ensemble spread

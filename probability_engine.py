@@ -68,6 +68,24 @@ class ProbabilityDistribution:
     most_likely_prob: float = 0.0
 
 
+def _renormalize(dist: ProbabilityDistribution) -> ProbabilityDistribution:
+    """Renormalize probabilities to sum to 1.0 after some buckets are invalidated."""
+    # Normalize combined probability
+    total = sum(b.probability for b in dist.buckets)
+    if total > 0 and total != 1.0:
+        for bucket in dist.buckets:
+            bucket.probability /= total
+
+    # Normalize each model's probabilities independently
+    for model in ["gefs", "ecmwf", "hrrr", "nws", "openmeteo"]:
+        model_total = sum(getattr(b, f"{model}_prob") for b in dist.buckets)
+        if model_total > 0 and model_total != 1.0:
+            for bucket in dist.buckets:
+                setattr(bucket, f"{model}_prob", getattr(bucket, f"{model}_prob") / model_total)
+
+    return dist
+
+
 def _create_buckets() -> list[TemperatureBucket]:
     """Create temperature buckets matching the Polymarket market format.
 
@@ -275,6 +293,19 @@ def compute_distribution(
     if total_prob > 0:
         for b in combined_buckets:
             b.probability /= total_prob
+
+    # Also normalize individual model probabilities so they sum to 100%
+    for model_probs, model_buckets in [
+        ("gefs", gefs_buckets),
+        ("ecmwf", ecmwf_buckets),
+        ("hrrr", hrrr_buckets),
+        ("nws", nws_buckets),
+        ("openmeteo", openmeteo_buckets),
+    ]:
+        total_model_prob = sum(b.probability for b in model_buckets)
+        if total_model_prob > 0:
+            for i, b in enumerate(combined_buckets):
+                setattr(b, f"{model_probs}_prob", model_buckets[i].probability / total_model_prob)
 
     # ── Aggregate statistics ────────────────────────────────────────
     all_temps = np.array(gefs_temps + ecmwf_temps + hrrr_temps + nws_temps + openmeteo_temps)
@@ -535,14 +566,29 @@ def apply_reality_check(
     else:
         effective_threshold = peak_passed_threshold_f  # fallback: original
 
+    # Determine when the observed high was recorded
+    high_local_hour: int | None = None
+    if observed_high_time is not None:
+        high_local_hour = (observed_high_time + _station_utc_offset()).hour
+
+    # Skip peak-passed logic if the observed high was recorded at an unreasonable
+    # hour (e.g., midnight = likely previous day's temp bleeding over)
+    if high_local_hour is not None and high_local_hour < 6:
+        u = config.MARKET.unit_symbol
+        logger.info(
+            f"  Observed high of {observed_high_f}{u} recorded at {high_local_hour:02d}:xx "
+            f"(unreasonable for daily high). Skipping peak-passed check."
+        )
+        dist = _renormalize(dist)
+        return dist
+
     peak_passed = current_temp_f < observed_high_f - effective_threshold
     if peak_passed:
         # Secondary factor: when was the high observed?
         peak_discount = 0.15  # default: moderate-strong (unknown timing)
-        high_local_hour: int | None = None
 
-        if observed_high_time is not None:
-            high_local_hour = (observed_high_time + _station_utc_offset()).hour
+        # high_local_hour already computed above
+        if high_local_hour is not None:
             if high_local_hour < 10:
                 peak_discount = 0.40
             elif high_local_hour < 14:

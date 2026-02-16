@@ -16,8 +16,12 @@ logger = logging.getLogger("current_conditions")
 NWS_OBS_URL = "https://api.weather.gov/stations/{icao}/observations"
 OPENMETEO_CURR_URL = "https://api.open-meteo.com/v1/forecast"
 OPENMETEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
-# Weather.com API for international stations (used for METAR data)
-WEATHER_COM_INTL_URL = "https://api.weather.com/v1/location/{icao}:9:{country}/observations/current.json"
+# NOAA ADDS API for METAR data (free, reliable, government source)
+NOAA_ADDS_URL = "https://aviationweather.gov/api/data/metar"
+# NOAA AWC API for TAF data
+TAF_URL = config.TAF_BASE_URL
+# NOAA AWC API for LAMP data
+LAMP_URL = config.LAMP_BASE_URL
 
 
 def _celsius_to_fahrenheit(c: float) -> float:
@@ -224,80 +228,65 @@ async def _fetch_metar_conditions(
     target_local_date,
     utc_offset: timedelta,
     as_of_utc: datetime | None = None,
+    retries: int = 3,
 ) -> dict | None:
     """
-    Fetch current conditions from Weather.com API for international METAR stations.
+    Fetch current conditions from NOAA ADDS API for METAR stations.
 
     Returns same format as NWS: {current_temp_f, observed_high_f, observed_at}.
-    Uses Weather.com which provides METAR data for international stations.
+    Uses NOAA Aviation Digital Data Service (ADDS) - free, reliable, government source.
+
+    Includes retry logic with exponential backoff for reliability.
     """
+    import asyncio
     from datetime import timezone as tz
 
-    # Determine country code from ICAO prefix
-    # RKSI -> KR (Korea)
-    country_map = {
-        "R": "KR",  # Korea
-        "Z": "CN",  # China
-        "V": "TH",  # Thailand
-        "WS": "SG", # Singapore
-        "WB": "MY", # Malaysia
-        "YM": "AU", # Australia
-        "NZ": "NZ", # New Zealand
-        "EG": "EG", # Egypt
-        "L": "FR",  # France/Germany/etc (Europe)
-        "E": "SE",  # Scandinavia
-        "K": "US",  # US (handled elsewhere)
-    }
+    # NOAA ADDS API endpoint
+    url = f"{NOAA_ADDS_URL}?ids={icao}&format=json"
 
-    # Get country code from first 1-2 characters of ICAO
-    country = "US"
-    if len(icao) >= 1:
-        prefix = icao[:1]
-        if prefix in country_map:
-            country = country_map[prefix]
-        elif len(icao) >= 2:
-            prefix2 = icao[:2]
-            if prefix2 in country_map:
-                country = country_map[prefix2]
-
-    url = WEATHER_COM_INTL_URL.format(icao=icao, country=country)
-    url_with_key = f"{url}?apiKey={config.WEATHER_COM_API_KEY}"
-
-    async with httpx.AsyncClient(timeout=15) as client:
+    for attempt in range(retries):
         try:
-            resp = await client.get(url_with_key)
-            resp.raise_for_status()
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
         except httpx.HTTPError as e:
-            logger.warning(f"METAR (Weather.com) fetch failed for {icao}: {e}")
+            if attempt < retries - 1:
+                wait_time = 2 ** attempt  # exponential backoff: 1, 2, 4 seconds
+                logger.warning(f"METAR (NOAA ADDS) fetch failed for {icao} (attempt {attempt + 1}/{retries}), retrying in {wait_time}s: {e}")
+                await asyncio.sleep(wait_time)
+                continue
+            logger.warning(f"METAR (NOAA ADDS) fetch failed for {icao} after {retries} attempts: {e}")
             return None
+        except Exception as e:
+            logger.warning(f"METAR (NOAA ADDS) unexpected error for {icao}: {e}")
+            return None
+        break  # Success, continue processing
 
-    data = resp.json()
-    observation = data.get("observation", {})
-    # Temperature is in imperial object for international stations (Fahrenheit)
-    imperial = observation.get("imperial", {})
-    temp_f = imperial.get("temp")
-    # Get the observed high for the day (max temp in last 24 hours)
-    observed_high_f = imperial.get("temp_max_24hour")
+    # NOAA ADDS returns an array of METARs, get the most recent one
+    if not data or not isinstance(data, list) or len(data) == 0:
+        logger.warning(f"No METAR data returned from NOAA ADDS for {icao}")
+        return None
 
-    if temp_f is None:
-        logger.warning("No temperature in Weather.com METAR response")
+    metar = data[0]
+
+    # Extract temperature (in Celsius from NOAA)
+    temp_c = metar.get("temp")
+    if temp_c is None:
+        logger.warning("No temperature in NOAA METAR response")
         return None
 
     # Convert to market's temperature unit
-    temp_c = _fahrenheit_to_celsius(temp_f)
     temp_value = round(config.MARKET.celsius_to_unit(temp_c), 1)
 
-    if observed_high_f is not None:
-        observed_high_c = _fahrenheit_to_celsius(observed_high_f)
-        observed_high_value = round(config.MARKET.celsius_to_unit(observed_high_c), 1)
-    else:
-        observed_high_value = None
+    # NOAA doesn't provide observed_high, use current temp as fallback
+    observed_high_value = temp_value
 
-    # Get the timestamp
-    obs_time_gmt = observation.get("obs_time")
-    if obs_time_gmt:
+    # Parse the observation time - NOAA uses Unix timestamp in obsTime
+    obs_time_ts = metar.get("obsTime")
+    if obs_time_ts:
         try:
-            obs_time = datetime.fromtimestamp(obs_time_gmt, tz=tz.utc)
+            obs_time = datetime.fromtimestamp(obs_time_ts, tz=tz.utc)
         except ValueError:
             obs_time = datetime.now(tz.utc)
     else:
@@ -315,14 +304,260 @@ async def _fetch_metar_conditions(
         return None
 
     u = config.MARKET.unit_symbol
-    logger.info(f"METAR (Weather.com): latest observation: {temp_value}{u} at {obs_time} UTC for {icao}")
+    logger.info(f"METAR (NOAA ADDS): latest observation: {temp_value}{u} at {obs_time} UTC for {icao}")
 
     return {
         "current_temp_f": temp_value,
-        "observed_high_f": observed_high_value if observed_high_value is not None else temp_value,
+        "observed_high_f": observed_high_value,
         "observed_high_time": obs_time,
         "observed_at": obs_time,
         "source": "metar",
+    }
+
+
+async def _fetch_taf_conditions(
+    icao: str,
+    target_local_date,
+    utc_offset: timedelta,
+    as_of_utc: datetime | None = None,
+    retries: int = 3,
+) -> dict | None:
+    """
+    Fetch forecast conditions from NOAA AWC API for TAF (Terminal Aerodrome Forecast).
+
+    Returns same format as NWS: {current_temp_f, observed_high_f, observed_at}.
+    TAF provides 24-30 hour forecasts with hour-by-hour breakdown.
+
+    Includes retry logic with exponential backoff for reliability.
+    """
+    import asyncio
+    from datetime import timezone as tz
+
+    # NOAA AWC API endpoint for TAF
+    url = f"{TAF_URL}?ids={icao}&format=json"
+
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPError as e:
+            if attempt < retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"TAF (NOAA AWC) fetch failed for {icao} (attempt {attempt + 1}/{retries}), retrying in {wait_time}s: {e}")
+                await asyncio.sleep(wait_time)
+                continue
+            logger.warning(f"TAF (NOAA AWC) fetch failed for {icao} after {retries} attempts: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"TAF (NOAA AWC) unexpected error for {icao}: {e}")
+            return None
+        break  # Success, continue processing
+
+    # NOAA AWC returns an array of TAFs, get the most recent one
+    if not data or not isinstance(data, list) or len(data) == 0:
+        logger.warning(f"No TAF data returned from NOAA AWC for {icao}")
+        return None
+
+    taf = data[0]
+
+    # Extract forecast temperatures from TAF
+    # TAF has a 'fcsts' array with forecast periods (note: plural)
+    fcst_array = taf.get("fcsts", [])
+
+    if not fcst_array:
+        logger.warning(f"No forecast data in TAF for {icao}")
+        return None
+
+    # Find forecasts for the target local date
+    temps_for_target_date: list[tuple[datetime, float]] = []
+
+    for fcst in fcst_array:
+        # Parse forecast valid time
+        valid_time_ts = fcst.get("validTime")
+        if valid_time_ts is None:
+            continue
+
+        try:
+            valid_time = datetime.fromtimestamp(valid_time_ts / 1000, tz=tz.utc)  # Convert ms to seconds
+        except (ValueError, OSError):
+            continue
+
+        # Check if this forecast is for the target local date
+        valid_local_date = (valid_time + utc_offset).date()
+        if valid_local_date != target_local_date:
+            continue
+
+        # Skip forecasts after as_of_utc for backtesting
+        if as_of_utc is not None and valid_time > as_of_utc:
+            continue
+
+        # Extract temperature (in Celsius from NOAA)
+        temp_c = fcst.get("temp")
+        if temp_c is None:
+            continue
+
+        temp_f = round(config.MARKET.celsius_to_unit(temp_c), 1)
+        temps_for_target_date.append((valid_time, temp_f))
+
+    if not temps_for_target_date:
+        logger.warning(f"No forecast temperatures found for target date {target_local_date} in TAF for {icao}")
+        return None
+
+    # Use the maximum forecast temperature as observed_high_f (daily high forecast)
+    # Sort by time to find the max temp
+    temps_for_target_date.sort(key=lambda x: x[0])
+    max_temp = max(temps_for_target_date, key=lambda x: x[1])
+    forecast_high_time = max_temp[0]
+    forecast_high_f = max_temp[1]
+
+    # Use the earliest forecast temp as current (or latest available)
+    # For TAF, we use the maximum as a proxy for the day's expected high
+    current_temp_f = forecast_high_f
+
+    # Get the issue time as observed_at (when the TAF was issued)
+    issue_time_ts = taf.get("issuetime")
+    if issue_time_ts:
+        try:
+            observed_at = datetime.fromtimestamp(issue_time_ts / 1000, tz=tz.utc)
+        except (ValueError, OSError):
+            observed_at = datetime.now(tz.utc)
+    else:
+        observed_at = datetime.now(tz.utc)
+
+    u = config.MARKET.unit_symbol
+    logger.info(f"TAF (NOAA AWC): forecast high: {forecast_high_f}{u} at {forecast_high_time} UTC for {icao}")
+    logger.info(f"TAF (NOAA AWC): issued at {observed_at} UTC")
+
+    return {
+        "current_temp_f": current_temp_f,
+        "observed_high_f": forecast_high_f,
+        "observed_high_time": forecast_high_time,
+        "observed_at": observed_at,
+        "source": "taf",
+    }
+
+
+async def _fetch_lamp_conditions(
+    icao: str,
+    target_local_date,
+    utc_offset: timedelta,
+    as_of_utc: datetime | None = None,
+    retries: int = 3,
+) -> dict | None:
+    """
+    Fetch hourly guidance from NOAA AWC API for LAMP (Local Aviation Model for Planning).
+
+    Returns same format as NWS: {current_temp_f, observed_high_f, observed_at}.
+    LAMP provides hourly guidance (ceiling, visibility, wind, temp) - great for nowcasting.
+
+    Includes retry logic with exponential backoff for reliability.
+    """
+    import asyncio
+    from datetime import timezone as tz
+
+    # NOAA AWC API endpoint for LAMP
+    url = f"{LAMP_URL}?ids={icao}&format=json"
+
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPError as e:
+            if attempt < retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"LAMP (NOAA AWC) fetch failed for {icao} (attempt {attempt + 1}/{retries}), retrying in {wait_time}s: {e}")
+                await asyncio.sleep(wait_time)
+                continue
+            logger.warning(f"LAMP (NOAA AWC) fetch failed for {icao} after {retries} attempts: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"LAMP (NOAA AWC) unexpected error for {icao}: {e}")
+            return None
+        break  # Success, continue processing
+
+    # NOAA AWC returns an array of LAMP data
+    if not data or not isinstance(data, list) or len(data) == 0:
+        logger.warning(f"No LAMP data returned from NOAA AWC for {icao}")
+        return None
+
+    lamp = data[0]
+
+    # Extract hourly forecast temperatures
+    # LAMP has an 'data' array with hourly forecasts
+    hourly_data = lamp.get("data", [])
+
+    if not hourly_data:
+        logger.warning(f"No hourly data in LAMP for {icao}")
+        return None
+
+    # Find forecasts for the target local date
+    temps_for_target_date: list[tuple[datetime, float]] = []
+
+    for hour_data in hourly_data:
+        # Parse forecast valid time
+        valid_time_ts = hour_data.get("validTime")
+        if valid_time_ts is None:
+            continue
+
+        try:
+            valid_time = datetime.fromtimestamp(valid_time_ts / 1000, tz=tz.utc)
+        except (ValueError, OSError):
+            continue
+
+        # Check if this forecast is for the target local date
+        valid_local_date = (valid_time + utc_offset).date()
+        if valid_local_date != target_local_date:
+            continue
+
+        # Skip forecasts after as_of_utc for backtesting
+        if as_of_utc is not None and valid_time > as_of_utc:
+            continue
+
+        # Extract temperature (in Celsius)
+        temp_c = hour_data.get("temp")
+        if temp_c is None:
+            continue
+
+        temp_f = round(config.MARKET.celsius_to_unit(temp_c), 1)
+        temps_for_target_date.append((valid_time, temp_f))
+
+    if not temps_for_target_date:
+        logger.warning(f"No forecast temperatures found for target date {target_local_date} in LAMP for {icao}")
+        return None
+
+    # Use the maximum forecast temperature as observed_high_f (daily high forecast)
+    temps_for_target_date.sort(key=lambda x: x[0])
+    max_temp = max(temps_for_target_date, key=lambda x: x[1])
+    forecast_high_time = max_temp[0]
+    forecast_high_f = max_temp[1]
+
+    # Use the latest available forecast temp as current
+    current_temp_f = temps_for_target_date[-1][1] if temps_for_target_date else forecast_high_f
+
+    # Get the issue time as observed_at (when the LAMP was issued)
+    issue_time_ts = lamp.get("issuetime")
+    if issue_time_ts:
+        try:
+            observed_at = datetime.fromtimestamp(issue_time_ts / 1000, tz=tz.utc)
+        except (ValueError, OSError):
+            observed_at = datetime.now(tz.utc)
+    else:
+        observed_at = datetime.now(tz.utc)
+
+    u = config.MARKET.unit_symbol
+    logger.info(f"LAMP (NOAA AWC): forecast high: {forecast_high_f}{u} at {forecast_high_time} UTC for {icao}")
+    logger.info(f"LAMP (NOAA AWC): issued at {observed_at} UTC")
+
+    return {
+        "current_temp_f": current_temp_f,
+        "observed_high_f": forecast_high_f,
+        "observed_high_time": forecast_high_time,
+        "observed_at": observed_at,
+        "source": "lamp",
     }
 
 
