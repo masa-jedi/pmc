@@ -10,13 +10,15 @@ forecast as one "ensemble member", giving us independent model diversity that
 raw ensemble members from a single model can't provide.
 
 Available models for temperature_2m_max:
+  - best_match (Open-Meteo's own blended "best" forecast)
   - gfs_seamless (NOAA GFS)
   - ecmwf_ifs025 (ECMWF IFS 0.25°)
   - jma_seamless (Japan Meteorological Agency)
   - icon_seamless (DWD ICON)
   - gem_seamless (Canadian GEM)
   - meteofrance_seamless (Météo-France ARPEGE)
-  - best_match (Open-Meteo's own blended "best" forecast)
+  - metno_seamless (MET Norway Nordic Seamless)
+  - metno (MET Norway Nordic 1km)
 """
 
 import logging
@@ -39,6 +41,8 @@ OPENMETEO_MODELS = [
     "icon_seamless",
     "gem_seamless",
     "meteofrance_seamless",
+    "metno_seamless",    # MET Norway Nordic Seamless with ECMWF
+    "metno",             # MET Norway Nordic (1km resolution)
 ]
 
 
@@ -93,14 +97,14 @@ async def fetch_openmeteo_forecast() -> dict:
                     temp_f = round(float(maxes[0]), 1)
                     result["forecast_temps_f"].append(temp_f)
                     result["member_details"][model] = temp_f
-                    logger.debug(f"  Open-Meteo {model}: {temp_f}°F")
+                    logger.info(f"  Open-Meteo {model}: {temp_f}°F")
                 else:
-                    logger.debug(f"  Open-Meteo {model}: no data for {target_date_str}")
+                    logger.info(f"  Open-Meteo {model}: no data for {target_date_str}")
 
             except httpx.HTTPError as e:
-                logger.debug(f"  Open-Meteo {model} failed: {e}")
+                logger.info(f"  Open-Meteo {model} failed: {e}")
             except (KeyError, ValueError, IndexError) as e:
-                logger.debug(f"  Open-Meteo {model} parse error: {e}")
+                logger.info(f"  Open-Meteo {model} parse error: {e}")
 
     if result["forecast_temps_f"]:
         result["cycle"] = "multi-model"
@@ -110,6 +114,11 @@ async def fetch_openmeteo_forecast() -> dict:
             f"min={min(temps):.1f}°F, max={max(temps):.1f}°F, "
             f"mean={sum(temps)/len(temps):.1f}°F"
         )
+        # Print individual model results
+        logger.info("=== Open-Meteo Model Results ===")
+        for model, temp in result["member_details"].items():
+            logger.info(f"  {model:25s}: {temp:>5.1f}°F")
+        logger.info("================================")
     else:
         logger.warning("Open-Meteo: no model data retrieved")
 
