@@ -271,6 +271,22 @@ async def fetch_gefs_ensemble(
     logger.info(
         f"GEFS fetch complete: {len(result['forecast_temps_f'])}/{len(GEFS_ALL_MEMBERS)} members retrieved"
     )
+
+    # Add detailed summary logging similar to Open-Meteo
+    if result["forecast_temps_f"]:
+        temps = result["forecast_temps_f"]
+        logger.info(
+            f"GEFS: {len(temps)} members retrieved — "
+            f"min={min(temps):.1f}°F, max={max(temps):.1f}°F, "
+            f"mean={sum(temps)/len(temps):.1f}°F"
+        )
+        logger.info("=== GEFS Member Results ===")
+        for member, member_temps in result["member_details"].items():
+            if member_temps:
+                max_temp = max(member_temps.values())
+                logger.info(f"  {member}: max={max_temp:.1f}°F ({len(member_temps)} hours)")
+        logger.info("============================")
+
     return result
 
 

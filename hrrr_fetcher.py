@@ -254,4 +254,20 @@ async def fetch_hrrr_forecast(
     logger.info(
         f"HRRR fetch complete: {len(result['forecast_temps_f'])}/{len(cycles)} cycles retrieved"
     )
+
+    # Add detailed summary logging similar to Open-Meteo
+    if result["forecast_temps_f"]:
+        temps = result["forecast_temps_f"]
+        logger.info(
+            f"HRRR: {len(temps)} cycles retrieved — "
+            f"min={min(temps):.1f}°F, max={max(temps):.1f}°F, "
+            f"mean={sum(temps)/len(temps):.1f}°F"
+        )
+        logger.info("=== HRRR Cycle Results ===")
+        for cycle_label, cycle_temps in result.get("member_details", {}).items():
+            if cycle_temps:
+                max_temp = max(cycle_temps.values())
+                logger.info(f"  {cycle_label}: max={max_temp:.1f}°F ({len(cycle_temps)} hours)")
+        logger.info("==========================")
+
     return result

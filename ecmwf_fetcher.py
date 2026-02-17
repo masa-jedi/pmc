@@ -225,6 +225,20 @@ async def fetch_ecmwf_open_data_via_package(
     except Exception as e:
         logger.error(f"ECMWF open data fetch failed: {e}")
 
+    # Add detailed summary logging similar to Open-Meteo
+    if result["forecast_temps_f"]:
+        temps = result["forecast_temps_f"]
+        logger.info(
+            f"ECMWF: {len(temps)} members retrieved — "
+            f"min={min(temps):.1f}°F, max={max(temps):.1f}°F, "
+            f"mean={sum(temps)/len(temps):.1f}°F"
+        )
+        logger.info("=== ECMWF Member Results ===")
+        for member, temp in result.get("member_details", {}).items():
+            if isinstance(temp, (int, float)):
+                logger.info(f"  {member}: {temp:.1f}°F")
+        logger.info("===========================")
+
     return result
 
 
@@ -300,6 +314,21 @@ async def fetch_ecmwf_open_data_raw() -> dict:
     logger.info(
         f"ECMWF raw fetch complete: {len(result['forecast_temps_f'])} member forecasts"
     )
+
+    # Add detailed summary logging similar to Open-Meteo
+    if result["forecast_temps_f"]:
+        temps = result["forecast_temps_f"]
+        logger.info(
+            f"ECMWF: {len(temps)} members retrieved — "
+            f"min={min(temps):.1f}°F, max={max(temps):.1f}°F, "
+            f"mean={sum(temps)/len(temps):.1f}°F"
+        )
+        logger.info("=== ECMWF Member Results ===")
+        for member, temp in result.get("member_details", {}).items():
+            if isinstance(temp, (int, float)):
+                logger.info(f"  {member}: {temp:.1f}°F")
+        logger.info("===========================")
+
     return result
 
 

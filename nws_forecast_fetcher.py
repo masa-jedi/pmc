@@ -138,4 +138,19 @@ async def fetch_nws_forecast() -> dict:
         else:
             logger.warning(f"NWS forecast: no daytime period found for {target_date}")
 
+    # Add detailed summary logging similar to Open-Meteo
+    if result["forecast_temps_f"]:
+        temps = result["forecast_temps_f"]
+        logger.info(
+            f"NWS: {len(temps)} forecast retrieved — "
+            f"high={temps[0]:.1f}°F"
+        )
+        logger.info("=== NWS Forecast Results ===")
+        nws_period = result.get("member_details", {}).get("nws_period", {})
+        logger.info(f"  nws_high: {temps[0]:.1f}°F")
+        if nws_period:
+            logger.info(f"  period: {nws_period.get('name', 'N/A')}")
+            logger.info(f"  shortForecast: {nws_period.get('shortForecast', 'N/A')}")
+        logger.info("===========================")
+
     return result

@@ -7,3 +7,5 @@ qodo
 .qodo
 .vscode
 .claude/*
+.claude/settings.local.json
+*.png
